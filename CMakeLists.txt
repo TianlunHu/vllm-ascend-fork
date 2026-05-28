@@ -109,7 +109,23 @@ set(
   ${ASCEND_HOME_PATH}/include
 )
 
+set(SHMEM_HOME_PATH "/usr/local/Ascend/shmem/latest" CACHE PATH "Ascend SHMEM install path")
+set(VLLM_ASCEND_SHMEM_LIBS)
+set(VLLM_ASCEND_SHMEM_LINK_DIRS)
+if(EXISTS "${SHMEM_HOME_PATH}/shmem/include/shmem.h" AND EXISTS "${SHMEM_HOME_PATH}/shmem/lib/libshmem.so")
+  message(STATUS "Ascend SHMEM runtime detected at ${SHMEM_HOME_PATH}; enabling zero-buffer SHMEM bindings")
+  list(APPEND VLLM_ASCEND_SHMEM_LIBS shmem)
+  list(APPEND VLLM_ASCEND_SHMEM_LINK_DIRS ${SHMEM_HOME_PATH}/shmem/lib)
+else()
+  message(STATUS "Ascend SHMEM runtime not found at ${SHMEM_HOME_PATH}; zero-buffer SHMEM bindings will use stubs")
+endif()
+
 pybind11_add_module(vllm_ascend_C ${VLLM_ASCEND_SRC})
+
+if(VLLM_ASCEND_SHMEM_LIBS)
+  target_compile_definitions(vllm_ascend_C PRIVATE VLLM_ASCEND_ENABLE_SHMEM_RUNTIME)
+  target_include_directories(vllm_ascend_C PRIVATE ${SHMEM_HOME_PATH}/shmem/include)
+endif()
 
 # Detect aclrtMemcpyBatchAsync availability (CANN 8.5+)
 # Can be overridden via VLLM_ASCEND_ENABLE_BATCH_MEMCPY env var (registered
@@ -161,12 +177,25 @@ if(NOT (SOC_VERSION MATCHES "ascend310p.*|ascend950"))
     target_compile_definitions(vllm_ascend_C PRIVATE -DVLLM_ENABLE_ATB_AND_DIRECT_KERNELS)
 endif()
 
+# Zero-buffer SHMEM MoE distribute ops are opt-in via VLLM_ASCEND_ENABLE_ZB_OPS.
+# Accept the same truthy spellings used by build_aclnn.sh and turn them into a
+# private compile definition consumed by torch_binding.cpp / torch_binding_meta.cpp.
+set(_zb_ops_value "${VLLM_ASCEND_ENABLE_ZB_OPS}")
+string(TOLOWER "${_zb_ops_value}" _zb_ops_value_lower)
+if(_zb_ops_value_lower MATCHES "^(1|true|on|yes)$")
+    message(STATUS "VLLM_ASCEND_ENABLE_ZB_OPS=${VLLM_ASCEND_ENABLE_ZB_OPS}: registering zero-buffer SHMEM MoE distribute ops")
+    target_compile_definitions(vllm_ascend_C PRIVATE -DVLLM_ASCEND_ENABLE_ZB_OPS)
+endif()
+unset(_zb_ops_value)
+unset(_zb_ops_value_lower)
+
 target_link_directories(
   vllm_ascend_C
   PRIVATE
   ${TORCH_LIBRARY_DIRS}
   ${TORCH_NPU_PATH}/lib/
   ${ASCEND_HOME_PATH}/lib64
+  ${VLLM_ASCEND_SHMEM_LINK_DIRS}
 )
 
 set(VLLM_ASCEND_C_COMMON_LIBS
@@ -179,6 +208,7 @@ set(VLLM_ASCEND_C_COMMON_LIBS
   ascendalog
   dl
   opapi
+  ${VLLM_ASCEND_SHMEM_LIBS}
 )
 
 if(SOC_VERSION MATCHES "ascend310p.*|ascend950")
@@ -197,6 +227,9 @@ else()
 endif()
 
 target_link_options(vllm_ascend_C PRIVATE "-Wl,-rpath,$ORIGIN:$ORIGIN/lib:$ORIGIN/_cann_ops_custom/vendors/custom_transformer/op_api/lib")
+if(VLLM_ASCEND_SHMEM_LINK_DIRS)
+  target_link_options(vllm_ascend_C PRIVATE "-Wl,-rpath,${SHMEM_HOME_PATH}/shmem/lib")
+endif()
 
 if(SOC_VERSION MATCHES "ascend310p.*|ascend950")
   install(TARGETS vllm_ascend_C DESTINATION ${VLLM_ASCEND_INSTALL_PATH})

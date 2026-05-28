@@ -112,6 +112,11 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Control the aclrtMemcpyBatchAsync compile path for KV cache offloading.
     # "1": force enable, "0": force disable, None: auto-detect from CANN headers.
     "VLLM_ASCEND_ENABLE_BATCH_MEMCPY": lambda: os.getenv("VLLM_ASCEND_ENABLE_BATCH_MEMCPY", None),
+    # Whether to build and register the SHMEM-based zero-buffer MoE distribute
+    # dispatch/combine custom ops. Off by default; set to "1"/"on"/"true" to
+    # enable. When enabled, build_aclnn.sh compiles the kernels and the C++
+    # extension registers torch.ops._C_ascend.shmem_moe_distribute_*_zero_buffer.
+    "VLLM_ASCEND_ENABLE_ZB_OPS": lambda: os.getenv("VLLM_ASCEND_ENABLE_ZB_OPS", None),
     # Whether to use MultiBlockPool for KV cache management
     "VLLM_ASCEND_APPLY_DSV4_PATCH": lambda: bool(int(os.getenv("VLLM_ASCEND_APPLY_DSV4_PATCH", "0"))),
 }
