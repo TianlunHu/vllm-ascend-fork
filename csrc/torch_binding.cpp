@@ -2391,6 +2391,14 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
     ops.impl("zb_shmem_alloc", c10::DispatchKey::CompositeExplicitAutograd,
              &vllm_ascend::zb_shmem_alloc);
 
+    ops.def("zb_shmem_alloc_tensor(int[] shape, ScalarType dtype, str device) -> Tensor");
+    ops.impl("zb_shmem_alloc_tensor", c10::DispatchKey::CompositeExplicitAutograd,
+             &vllm_ascend::zb_shmem_alloc_tensor);
+
+    ops.def("zb_shmem_alias_tensor(Tensor base, int[] shape, ScalarType dtype) -> Tensor");
+    ops.impl("zb_shmem_alias_tensor", c10::DispatchKey::CompositeExplicitAutograd,
+             &vllm_ascend::zb_shmem_alias_tensor);
+
     ops.def("zb_shmem_free(int ptr) -> ()");
     ops.impl("zb_shmem_free", c10::DispatchKey::CompositeExplicitAutograd,
              &vllm_ascend::zb_shmem_free);

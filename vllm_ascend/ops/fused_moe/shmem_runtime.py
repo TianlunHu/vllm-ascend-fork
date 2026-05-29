@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Sequence
 
 import torch
 
@@ -14,6 +14,13 @@ from vllm_ascend.utils import enable_custom_op
 DEFAULT_LOCAL_MEM_SIZE = 4 * 1024 * 1024 * 1024
 
 DEFAULT_COMM_ALG = "fullmesh_v1"
+
+
+@dataclass
+class LowLatencyShmemTensors:
+    combine_x: torch.Tensor
+    expand_x_out: torch.Tensor
+    dynamic_scales_out: Optional[torch.Tensor]
 
 
 def _ensure_custom_op_loaded() -> None:
@@ -56,6 +63,54 @@ class ShmemMoERuntime:
         _ensure_custom_op_loaded()
         self.ext_info = int(torch.ops._C_ascend.zb_shmem_alloc(element_count, element_size))
         return self.ext_info
+
+    def alloc_tensor(
+        self,
+        shape: Sequence[int],
+        dtype: torch.dtype,
+        device: torch.device | str,
+    ) -> torch.Tensor:
+        """Allocate a SHMEM-backed NPU tensor.
+
+        Tensor data buffers are independent from ``ext_info``. The latter is
+        the metadata/control buffer allocated by :meth:`alloc` and passed to
+        zero-buffer kernels.
+        """
+        _ensure_custom_op_loaded()
+        return torch.ops._C_ascend.zb_shmem_alloc_tensor(list(shape), dtype, str(device))
+
+    def alias_tensor(self, base: torch.Tensor, shape: Sequence[int], dtype: torch.dtype) -> torch.Tensor:
+        """Create a tensor view with a different dtype over a SHMEM tensor buffer."""
+        _ensure_custom_op_loaded()
+        return torch.ops._C_ascend.zb_shmem_alias_tensor(base, list(shape), dtype)
+
+    def allocate_low_latency_tensors(
+        self,
+        max_recv_tokens: int,
+        hidden_size: int,
+        device: torch.device | str,
+        *,
+        use_quant: bool = False,
+    ) -> LowLatencyShmemTensors:
+        """Allocate the SHMEM tensors required by the zero-buffer low-latency path.
+
+        This mirrors deepep_standalone's ``preallocate_lowlatency_shmem_tensors``:
+        ``combine_x`` is always BF16; ``expand_x_out`` aliases it as INT8 when
+        quantization is enabled, otherwise it owns a separate BF16 SHMEM buffer.
+        ``dynamic_scales_out`` exists only for the quantized path.
+        """
+        combine_x = self.alloc_tensor([max_recv_tokens, hidden_size], torch.bfloat16, device)
+        if use_quant:
+            expand_x_out = self.alias_tensor(combine_x, [max_recv_tokens, hidden_size], torch.int8)
+            dynamic_scales_out = self.alloc_tensor([max_recv_tokens], torch.float32, device)
+        else:
+            expand_x_out = self.alloc_tensor([max_recv_tokens, hidden_size], torch.bfloat16, device)
+            dynamic_scales_out = None
+        return LowLatencyShmemTensors(
+            combine_x=combine_x,
+            expand_x_out=expand_x_out,
+            dynamic_scales_out=dynamic_scales_out,
+        )
 
     def get_ext_info(self) -> int:
         _ensure_custom_op_loaded()

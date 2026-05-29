@@ -17,10 +17,13 @@
 #include "shmem_runtime.h"
 
 #include <algorithm>
+#include <limits>
 #include <mutex>
 #include <string>
+#include <vector>
 
 #include <c10/util/Exception.h>
+#include "torch_npu/csrc/aten/common/from_blob.h"
 
 #ifdef VLLM_ASCEND_ENABLE_SHMEM_RUNTIME
 #include "shmem.h"
@@ -32,6 +35,7 @@ namespace {
 std::mutex g_shmem_mutex;
 bool g_initialized = false;
 void *g_ext_info = nullptr;
+std::vector<void *> g_tensor_ptrs;
 
 #ifndef VLLM_ASCEND_ENABLE_SHMEM_RUNTIME
 void throw_shmem_unavailable()
@@ -65,6 +69,41 @@ int32_t fill_init_attr(int32_t rank, int32_t world_size, uint64_t local_mem_size
     return ACLSHMEM_SUCCESS;
 }
 #endif
+
+int64_t checked_numel(c10::ArrayRef<int64_t> shape)
+{
+    TORCH_CHECK(!shape.empty(), "shape must not be empty");
+    int64_t numel = 1;
+    for (int64_t dim : shape) {
+        TORCH_CHECK(dim > 0, "all shape dimensions must be positive, got ", dim);
+        TORCH_CHECK(numel <= std::numeric_limits<int64_t>::max() / dim,
+                    "shape is too large for zero-buffer SHMEM tensor allocation");
+        numel *= dim;
+    }
+    return numel;
+}
+
+size_t checked_nbytes(c10::ArrayRef<int64_t> shape, at::ScalarType dtype)
+{
+    int64_t numel = checked_numel(shape);
+    size_t element_size = c10::elementSize(dtype);
+    TORCH_CHECK(element_size > 0, "invalid dtype element size");
+    TORCH_CHECK(static_cast<uint64_t>(numel) <= std::numeric_limits<uint64_t>::max() / element_size,
+                "byte size overflow for zero-buffer SHMEM tensor allocation");
+    return static_cast<size_t>(numel) * element_size;
+}
+
+void free_tensor_buffers()
+{
+#ifdef VLLM_ASCEND_ENABLE_SHMEM_RUNTIME
+    for (void *ptr : g_tensor_ptrs) {
+        if (ptr != nullptr) {
+            aclshmem_free(ptr);
+        }
+    }
+    g_tensor_ptrs.clear();
+#endif
+}
 
 } // namespace
 
@@ -115,6 +154,40 @@ int64_t zb_shmem_alloc(int64_t element_count, int64_t element_size)
 #endif
 }
 
+at::Tensor zb_shmem_alloc_tensor(c10::ArrayRef<int64_t> shape, at::ScalarType dtype, const std::string &device)
+{
+#ifndef VLLM_ASCEND_ENABLE_SHMEM_RUNTIME
+    throw_shmem_unavailable();
+#else
+    std::lock_guard<std::mutex> guard(g_shmem_mutex);
+    TORCH_CHECK(g_initialized, "SHMEM runtime must be initialized before tensor allocation");
+
+    size_t nbytes = checked_nbytes(shape, dtype);
+    void *tensor_ptr = aclshmem_malloc(nbytes);
+    TORCH_CHECK(tensor_ptr != nullptr, "aclshmem_malloc failed");
+    g_tensor_ptrs.push_back(tensor_ptr);
+
+    std::vector<int64_t> tensor_shape(shape.begin(), shape.end());
+    auto options = at::TensorOptions().dtype(dtype).device(at::Device(device));
+    return at_npu::native::from_blob(tensor_ptr, c10::IntArrayRef(tensor_shape), [](void *) {}, options);
+#endif
+}
+
+at::Tensor zb_shmem_alias_tensor(const at::Tensor &base, c10::ArrayRef<int64_t> shape, at::ScalarType dtype)
+{
+    TORCH_CHECK(base.defined(), "base tensor must be defined");
+    TORCH_CHECK(base.is_contiguous(), "base tensor must be contiguous");
+
+    size_t alias_nbytes = checked_nbytes(shape, dtype);
+    size_t base_nbytes = static_cast<size_t>(base.numel()) * base.element_size();
+    TORCH_CHECK(alias_nbytes <= base_nbytes, "alias tensor byte size ", alias_nbytes,
+                " exceeds base tensor byte size ", base_nbytes);
+
+    std::vector<int64_t> tensor_shape(shape.begin(), shape.end());
+    auto options = at::TensorOptions().dtype(dtype).device(base.device());
+    return at_npu::native::from_blob(base.data_ptr(), c10::IntArrayRef(tensor_shape), [](void *) {}, options);
+}
+
 void zb_shmem_free(int64_t ptr)
 {
 #ifdef VLLM_ASCEND_ENABLE_SHMEM_RUNTIME
@@ -136,6 +209,7 @@ void zb_shmem_finalize()
 {
 #ifdef VLLM_ASCEND_ENABLE_SHMEM_RUNTIME
     std::lock_guard<std::mutex> guard(g_shmem_mutex);
+    free_tensor_buffers();
     if (g_ext_info != nullptr) {
         aclshmem_free(g_ext_info);
         g_ext_info = nullptr;

@@ -19,10 +19,15 @@
 #include <cstdint>
 #include <string>
 
+#include <ATen/ATen.h>
+#include <c10/core/ScalarType.h>
+
 namespace vllm_ascend {
 
 int64_t zb_shmem_init(int64_t rank, int64_t world_size, int64_t local_mem_size, const std::string &server_ip_port);
 int64_t zb_shmem_alloc(int64_t element_count, int64_t element_size);
+at::Tensor zb_shmem_alloc_tensor(c10::ArrayRef<int64_t> shape, at::ScalarType dtype, const std::string &device);
+at::Tensor zb_shmem_alias_tensor(const at::Tensor &base, c10::ArrayRef<int64_t> shape, at::ScalarType dtype);
 void zb_shmem_free(int64_t ptr);
 void zb_shmem_finalize();
 int64_t zb_shmem_get_ext_info();
