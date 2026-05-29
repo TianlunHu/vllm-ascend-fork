@@ -11,9 +11,118 @@ import torch
 
 from vllm_ascend.utils import enable_custom_op
 
+# Per-rank SHMEM heap passed to aclshmemx_init_attr(local_mem_size). All subsequent
+# aclshmem_malloc / aclshmemx_calloc allocations are carved from this pool.
 DEFAULT_LOCAL_MEM_SIZE = 4 * 1024 * 1024 * 1024
 
+# Control/metadata buffer (ext_info / gva_ptr) size. Matches deepep_standalone's
+# SHMEM_META_DATA_SIZE = 1 MiB. This is NOT tensor payload; kernels only need a
+# small metainfo region, typically well under 2 MiB.
+DEFAULT_EXT_INFO_BYTES = 1 * 1024 * 1024
+
+# Small fixed bookkeeping inside the SHMEM pool (see deepep_standalone fixed_bytes).
+DEFAULT_SHMEM_FIXED_OVERHEAD_BYTES = 64 * 1024
+
+# Extra headroom for allocator alignment / runtime metadata beyond tensor payloads.
+DEFAULT_SHMEM_POOL_SLACK_BYTES = 32 * 1024 * 1024
+
+SHMEM_POOL_ALIGN_BYTES = 2 * 1024 * 1024
+
 DEFAULT_COMM_ALG = "fullmesh_v1"
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None or raw == "":
+        return default
+    return int(raw)
+
+
+def _round_up(value: int, alignment: int) -> int:
+    if alignment <= 0:
+        return value
+    return ((value + alignment - 1) // alignment) * alignment
+
+
+def estimate_low_latency_tensor_bytes(
+    max_recv_tokens: int,
+    hidden_size: int,
+    *,
+    use_quant: bool = False,
+) -> int:
+    """Bytes required by SHMEM-backed low-latency data tensors only."""
+    if max_recv_tokens <= 0 or hidden_size <= 0:
+        raise ValueError("max_recv_tokens and hidden_size must be positive")
+
+    combine_x_bytes = max_recv_tokens * hidden_size * 2  # BF16
+    if use_quant:
+        # expand_x_out aliases combine_x; only dynamic_scales_out is extra.
+        return combine_x_bytes + max_recv_tokens * 4
+    # Non-quant path owns separate BF16 combine_x and expand_x_out buffers.
+    return combine_x_bytes * 2
+
+
+def compute_low_latency_max_recv_tokens(
+    num_tokens_per_rank: int,
+    ep_world_size: int,
+    num_local_experts: int,
+    *,
+    max_tokens_per_rank: int | None = None,
+    min_recv_tokens: int = 1024,
+) -> int:
+    """Mirror deepep_standalone's low-latency max_recv_tokens sizing."""
+    per_rank = max(num_tokens_per_rank, max_tokens_per_rank or 0)
+    calculated = per_rank * ep_world_size * num_local_experts
+    return max(calculated, min_recv_tokens)
+
+
+def estimate_local_mem_size(
+    max_recv_tokens: int,
+    hidden_size: int,
+    *,
+    use_quant: bool = False,
+    ext_info_bytes: int | None = None,
+    moe_expert_num: int | None = None,
+    ep_world_size: int | None = None,
+    fixed_overhead_bytes: int | None = None,
+    pool_slack_bytes: int | None = None,
+) -> int:
+    """Estimate aclshmemx_init_attr(local_mem_size) for the ZB low-latency path.
+
+    Components:
+      - ``ext_info`` metainfo (default 1 MiB, configurable)
+      - ``combine_x`` / ``expand_x_out`` / optional ``dynamic_scales_out``
+      - small fixed bookkeeping (optional, scales with expert layout)
+      - pool slack for alignment/runtime overhead
+    """
+    ext_bytes = ext_info_bytes if ext_info_bytes is not None else _env_int(
+        "VLLM_ASCEND_ZB_EXT_INFO_BYTES", DEFAULT_EXT_INFO_BYTES)
+    if ext_bytes <= 0:
+        raise ValueError("ext_info_bytes must be positive")
+
+    data_bytes = estimate_low_latency_tensor_bytes(
+        max_recv_tokens,
+        hidden_size,
+        use_quant=use_quant,
+    )
+
+    fixed_bytes = fixed_overhead_bytes
+    if fixed_bytes is None:
+        if moe_expert_num is not None and ep_world_size is not None:
+            # deepep_standalone: E * 4 + R * E * 4
+            fixed_bytes = moe_expert_num * 4 + ep_world_size * moe_expert_num * 4
+        else:
+            fixed_bytes = DEFAULT_SHMEM_FIXED_OVERHEAD_BYTES
+
+    slack_bytes = pool_slack_bytes if pool_slack_bytes is not None else _env_int(
+        "VLLM_ASCEND_ZB_SHMEM_POOL_SLACK_BYTES", DEFAULT_SHMEM_POOL_SLACK_BYTES)
+
+    override = os.getenv("VLLM_ASCEND_ZB_SHMEM_LOCAL_MEM_SIZE")
+    if override:
+        return int(override)
+
+    total = ext_bytes + data_bytes + fixed_bytes + slack_bytes
+    return _round_up(total, SHMEM_POOL_ALIGN_BYTES)
 
 
 @dataclass
@@ -63,6 +172,20 @@ class ShmemMoERuntime:
         _ensure_custom_op_loaded()
         self.ext_info = int(torch.ops._C_ascend.zb_shmem_alloc(element_count, element_size))
         return self.ext_info
+
+    def alloc_ext_info(self, nbytes: int | None = None) -> int:
+        """Allocate the ZB metainfo/control buffer (``ext_info`` / ``gva_ptr``).
+
+        deepep_standalone uses ``SHMEM_META_DATA_SIZE = 1 MiB`` via
+        ``aclshmemx_calloc(SHMEM_META_DATA_SIZE / 4, 4)``.
+        """
+        raw_bytes = nbytes if nbytes is not None else _env_int(
+            "VLLM_ASCEND_ZB_EXT_INFO_BYTES", DEFAULT_EXT_INFO_BYTES)
+        if raw_bytes <= 0:
+            raise ValueError("ext_info nbytes must be positive")
+        if raw_bytes % 4 != 0:
+            raise ValueError("ext_info nbytes must be a multiple of 4")
+        return self.alloc(raw_bytes // 4, 4)
 
     def alloc_tensor(
         self,

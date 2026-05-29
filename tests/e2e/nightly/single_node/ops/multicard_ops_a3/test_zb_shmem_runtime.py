@@ -37,6 +37,7 @@ import torch_npu
 from vllm_ascend.ops.fused_moe.shmem_runtime import (
     LowLatencyShmemTensors,
     ShmemMoERuntime,
+    estimate_local_mem_size,
 )
 from vllm_ascend.utils import enable_custom_op
 
@@ -53,10 +54,18 @@ def _worker(rank: int, world_size: int, results) -> None:
     try:
         torch_npu.npu.set_device(rank)
 
+        max_recv_tokens = 1024
+        hidden_size = 2048
+        local_mem_size = estimate_local_mem_size(
+            max_recv_tokens,
+            hidden_size,
+            use_quant=True,
+        )
         runtime = ShmemMoERuntime(
             rank=rank,
             world_size=world_size,
             server_ip_port=_shmem_server_ipport(),
+            local_mem_size=local_mem_size,
         )
 
         actual_rank = runtime.init()
@@ -64,7 +73,7 @@ def _worker(rank: int, world_size: int, results) -> None:
             f"rank mismatch from aclshmem_my_pe: expected {rank}, got {actual_rank}")
         assert runtime.is_initialized(), "SHMEM runtime reports uninitialised"
 
-        ext_info = runtime.alloc(element_count=1024 * 256, element_size=4)
+        ext_info = runtime.alloc_ext_info()
         assert ext_info != 0, "ext_info metadata buffer must be non-zero"
         assert runtime.get_ext_info() == ext_info, "ext_info inconsistent across getter"
 
@@ -73,8 +82,8 @@ def _worker(rank: int, world_size: int, results) -> None:
         # Non-quant path: combine_x and expand_x_out are independent BF16 SHMEM
         # tensors; dynamic_scales_out is absent.
         bundle = runtime.allocate_low_latency_tensors(
-            max_recv_tokens=1024,
-            hidden_size=2048,
+            max_recv_tokens=max_recv_tokens,
+            hidden_size=hidden_size,
             device=device,
             use_quant=False,
         )
@@ -90,8 +99,8 @@ def _worker(rank: int, world_size: int, results) -> None:
         # Quant path: expand_x_out aliases combine_x as INT8 over the same SHMEM
         # buffer; dynamic_scales_out is a separate FP32 SHMEM allocation.
         qbundle = runtime.allocate_low_latency_tensors(
-            max_recv_tokens=1024,
-            hidden_size=2048,
+            max_recv_tokens=max_recv_tokens,
+            hidden_size=hidden_size,
             device=device,
             use_quant=True,
         )

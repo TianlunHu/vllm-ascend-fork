@@ -42,6 +42,7 @@ import torch_npu
 
 from vllm_ascend.ops.fused_moe.shmem_runtime import (
     ShmemMoERuntime,
+    estimate_local_mem_size,
     shmem_moe_distribute_combine_zero_buffer,
     shmem_moe_distribute_dispatch_zero_buffer,
 )
@@ -182,13 +183,20 @@ def _worker(rank: int, world_size: int, port: int,
 
         device = f"npu:{rank}"
 
+        local_mem_size = estimate_local_mem_size(
+            num_max_tokens,
+            hidden,
+            moe_expert_num=num_experts,
+            ep_world_size=world_size,
+        )
         runtime = ShmemMoERuntime(
             rank=rank,
             world_size=world_size,
             server_ip_port=_shmem_server_ipport(),
+            local_mem_size=local_mem_size,
         )
         runtime.init()
-        runtime.alloc(element_count=2 * 1024 * 1024, element_size=4)
+        runtime.alloc_ext_info()
 
         bundle = runtime.allocate_low_latency_tensors(
             max_recv_tokens=num_max_tokens,
