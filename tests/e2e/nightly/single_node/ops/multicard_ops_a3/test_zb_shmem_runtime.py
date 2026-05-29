@@ -45,12 +45,8 @@ enable_custom_op()
 
 def _shmem_server_ipport() -> str:
     raw = os.environ.get("VLLM_ASCEND_ZB_SHMEM_URI", "tcp://127.0.0.1:29555")
-    # ShmemMoERuntime expects bare "ip:port", aclshmemx_init_attr prepends
-    # transport prefixes internally; tolerate the "tcp://" form for parity
-    # with deepep_standalone's CLI.
-    if raw.startswith("tcp://"):
-        return raw[len("tcp://"):]
-    return raw
+    # Ascend SHMEM expects the transport prefix in aclshmemx_init_attr.
+    return raw if "://" in raw else f"tcp://{raw}"
 
 
 def _worker(rank: int, world_size: int, results) -> None:

@@ -52,9 +52,7 @@ enable_custom_op()
 
 def _shmem_server_ipport() -> str:
     raw = os.environ.get("VLLM_ASCEND_ZB_SHMEM_URI", "tcp://127.0.0.1:29555")
-    if raw.startswith("tcp://"):
-        return raw[len("tcp://"):]
-    return raw
+    return raw if "://" in raw else f"tcp://{raw}"
 
 
 def _hccl_master_port() -> int:
