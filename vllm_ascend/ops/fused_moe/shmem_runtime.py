@@ -255,6 +255,11 @@ def shmem_moe_distribute_combine_zero_buffer(
     (typically the same value used by ``shmem_moe_distribute_dispatch_zero_buffer``).
     """
     _ensure_zb_op_available("shmem_moe_distribute_combine_zero_buffer")
+    if tp_send_count is None:
+        # The combine tiling marks tp_send_count optional, but still validates
+        # its shape and dtype. deepep_standalone always passes an int32 tensor
+        # with one entry per TP rank even when tp_world_size == 1.
+        tp_send_count = torch.empty((tp_world_size,), dtype=torch.int32, device=expand_x.device)
     return torch.ops._C_ascend.shmem_moe_distribute_combine_zero_buffer(
         expand_x,
         expert_ids,
