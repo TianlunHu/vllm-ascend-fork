@@ -117,6 +117,15 @@ env_variables: dict[str, Callable[[], Any]] = {
     # enable. When enabled, build_aclnn.sh compiles the kernels and the C++
     # extension registers torch.ops._C_ascend.shmem_moe_distribute_*_zero_buffer.
     "VLLM_ASCEND_ENABLE_ZB_OPS": lambda: os.getenv("VLLM_ASCEND_ENABLE_ZB_OPS", None),
+    # Runtime switch for routing TokenDispatcherWithMC2 through the SHMEM
+    # zero-buffer dispatch/combine ops instead of the default
+    # torch_npu.npu_moe_distribute_*_v2 path. Requires the build to have set
+    # VLLM_ASCEND_ENABLE_ZB_OPS=1 and a reachable SHMEM control endpoint via
+    # VLLM_ASCEND_ZB_SHMEM_URI.
+    "VLLM_ASCEND_ENABLE_ZB_SHMEM": lambda: bool(int(os.getenv("VLLM_ASCEND_ENABLE_ZB_SHMEM", "0"))),
+    # SHMEM control endpoint forwarded to aclshmemx_init_attr. Format:
+    # "tcp://<host>:<port>". Must be identical across all ranks of the EP group.
+    "VLLM_ASCEND_ZB_SHMEM_URI": lambda: os.getenv("VLLM_ASCEND_ZB_SHMEM_URI", ""),
     # Whether to use MultiBlockPool for KV cache management
     "VLLM_ASCEND_APPLY_DSV4_PATCH": lambda: bool(int(os.getenv("VLLM_ASCEND_APPLY_DSV4_PATCH", "0"))),
 }
