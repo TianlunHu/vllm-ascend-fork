@@ -263,20 +263,69 @@ class TokenDispatcherWithMC2(MoETokenDispatcher[MoEMC2CombineMetadata]):
             server_ip_port=uri,
             local_mem_size=local_mem_size,
         )
-        logger.info(
-            "ZB SHMEM init starting: ep_rank=%d ep_world_size=%d uri=%s "
-            "local_mem_size=%.1fMiB",
+        # Temporary diagnostics for serving bring-up. Remove before merging
+        # once the SHMEM ZB path is verified end-to-end.
+        # Use logger.warning instead of print/info: print/info can be
+        # swallowed by vLLM stdout redirection in worker subprocesses, and
+        # the SHMEM init failure (status=-9 / ACLSHMEM_DL_FUNC_FAILED) is
+        # most often caused by a missing/stale ASCEND_HOME_PATH or missing
+        # CANN .so under $ASCEND_HOME_PATH/lib64 that we can detect from
+        # Python before the C++ call.
+        import os
+        ascend_home = os.environ.get("ASCEND_HOME_PATH", "")
+        lib64 = os.path.join(ascend_home, "lib64") if ascend_home else ""
+        required_libs = ("libascendcl.so", "libascend_hal.so")
+        lib_status = {
+            name: (os.path.exists(os.path.join(lib64, name)) if lib64 else False)
+            for name in required_libs
+        }
+        logger.warning(
+            "[ZB_SHMEM] init starting: ep_rank=%d ep_world_size=%d uri=%s "
+            "local_mem_size=%.1fMiB ASCEND_HOME_PATH=%r lib64=%r libs=%s "
+            "LD_LIBRARY_PATH=%r SHMEM_LOG_LEVEL=%r",
             self.ep_rank_id,
             self.ep_world_size,
             uri,
             local_mem_size / (1024 * 1024),
+            ascend_home,
+            lib64,
+            lib_status,
+            os.environ.get("LD_LIBRARY_PATH", ""),
+            os.environ.get("SHMEM_LOG_LEVEL", ""),
         )
-        # SHMEM init is a collective over all PEs. In serving, the first MoE
-        # forward can happen during memory profiling / graph warmup, where ranks
-        # may arrive at different times. Synchronize once before initializing.
-        torch.distributed.barrier(group=get_mc2_group().device_group)
-        runtime.init()
-        torch.distributed.barrier(group=get_mc2_group().device_group)
+        if not ascend_home or not all(lib_status.values()):
+            logger.error(
+                "[ZB_SHMEM] init pre-check FAILED on ep_rank=%d: "
+                "ASCEND_HOME_PATH or required CANN libs missing in worker "
+                "process environment. aclshmemx_init_attr will return -9 "
+                "(ACLSHMEM_DL_FUNC_FAILED). Make sure 'source "
+                "/usr/local/Ascend/ascend-toolkit/set_env.sh' is exported to "
+                "ALL workers (e.g. add it to the launch script before "
+                "'vllm serve' so the env is inherited by EngineCore/Worker "
+                "subprocesses).",
+                self.ep_rank_id,
+            )
+        try:
+            runtime.init()
+        except RuntimeError as e:
+            msg = str(e)
+            if "status=-9" in msg or "DL_FUNC_FAILED" in msg:
+                logger.error(
+                    "[ZB_SHMEM] aclshmemx_init_attr returned -9 "
+                    "(ACLSHMEM_DL_FUNC_FAILED) on ep_rank=%d. Root cause is "
+                    "dlopen/dlsym of CANN libraries under "
+                    "%s/lib64. To see the actual dlerror message, restart "
+                    "with SHMEM_LOG_LEVEL=DEBUG and SHMEM_LOG_TO_STDOUT=1 in "
+                    "the launch environment.",
+                    self.ep_rank_id,
+                    ascend_home or "<ASCEND_HOME_PATH unset>",
+                )
+            raise
+        logger.warning(
+            "[ZB_SHMEM] runtime.init OK: ep_rank=%d actual_rank=%d",
+            self.ep_rank_id,
+            runtime.rank,
+        )
         runtime.alloc_ext_info()
         bundle = runtime.allocate_low_latency_tensors(
             max_recv_tokens=max_recv_tokens,
