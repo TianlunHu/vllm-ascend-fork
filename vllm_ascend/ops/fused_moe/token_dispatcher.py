@@ -23,6 +23,8 @@
 from abc import ABC, abstractmethod
 from typing import Generic
 
+import logging
+
 import torch
 import torch_npu
 from vllm.config import get_current_vllm_config
@@ -52,6 +54,8 @@ from vllm_ascend.utils import (
 
 EXPERT_TOKEN_NUMS_TYPE_CUMSUM = 0
 EXPERT_TOKEN_NUMS_TYPE_COUNT = 1
+
+logger = logging.getLogger(__name__)
 
 
 def _get_expert_token_nums_type(token_dispatch_input: MoETokenDispatchInput) -> int:
@@ -156,6 +160,18 @@ class TokenDispatcherWithMC2(MoETokenDispatcher[MoEMC2CombineMetadata]):
         self._zb_shmem_enabled = bool(envs_ascend.VLLM_ASCEND_ENABLE_ZB_SHMEM)
         if self._zb_shmem_enabled:
             self._validate_zb_shmem_compat()
+            logger.info(
+                "TokenDispatcherWithMC2: ZB SHMEM dispatch enabled "
+                "(ep_world_size=%d, ep_rank_id=%d). Runtime + tensor pool "
+                "will be allocated lazily on the first token_dispatch call.",
+                self.ep_world_size,
+                self.ep_rank_id,
+            )
+        else:
+            logger.info(
+                "TokenDispatcherWithMC2: ZB SHMEM dispatch disabled "
+                "(VLLM_ASCEND_ENABLE_ZB_SHMEM=0); using torch_npu.npu_moe_distribute_*_v2 path."
+            )
         # Lazy SHMEM state populated on first token_dispatch.
         self._zb_runtime = None
         self._zb_bundle = None
@@ -165,6 +181,10 @@ class TokenDispatcherWithMC2(MoETokenDispatcher[MoEMC2CombineMetadata]):
         self._zb_moe_expert_num = None
         self._zb_use_quant = None
         self._zb_dispatch_quant_mode = None
+        # Temporary diagnostics for validating the serving path. Remove before
+        # merging once the SHMEM ZB path is verified end-to-end.
+        self._zb_dispatch_calls = 0
+        self._zb_combine_calls = 0
         self.moe_expert_num = 0
 
     def _validate_zb_shmem_compat(self) -> None:
@@ -184,6 +204,10 @@ class TokenDispatcherWithMC2(MoETokenDispatcher[MoEMC2CombineMetadata]):
             raise RuntimeError(
                 "VLLM_ASCEND_ENABLE_ZB_SHMEM=1 but zero-buffer ops are not registered; "
                 "rebuild vllm_ascend_C with VLLM_ASCEND_ENABLE_ZB_OPS=1.")
+
+    @staticmethod
+    def _should_log_zb_call(count: int) -> bool:
+        return count <= 3 or count in (10, 100, 1000)
 
     def _ensure_zb_initialized(
         self,
@@ -273,6 +297,20 @@ class TokenDispatcherWithMC2(MoETokenDispatcher[MoEMC2CombineMetadata]):
         self._zb_max_recv_tokens = max_recv_tokens
         self._zb_moe_expert_num = moe_expert_num
         self._zb_use_quant = use_quant
+
+        logger.info(
+            "ZB SHMEM dispatch initialized: ep_rank=%d ep_world_size=%d "
+            "hidden=%d moe_expert_num=%d use_quant=%s max_recv_tokens=%d "
+            "local_mem_size=%.1fMiB ext_info=%d",
+            self.ep_rank_id,
+            self.ep_world_size,
+            hidden,
+            moe_expert_num,
+            use_quant,
+            max_recv_tokens,
+            local_mem_size / (1024 * 1024),
+            int(runtime.ext_info),
+        )
 
     def get_dispatch_mc2_kwargs(
         self,
@@ -391,6 +429,19 @@ class TokenDispatcherWithMC2(MoETokenDispatcher[MoEMC2CombineMetadata]):
         bundle = self._zb_bundle
         aux = self._zb_aux
         runtime = self._zb_runtime
+
+        self._zb_dispatch_calls += 1
+        if self._should_log_zb_call(self._zb_dispatch_calls):
+            logger.info(
+                "ZB SHMEM dispatch call #%d: ep_rank=%d x_shape=%s "
+                "expand_x_out_shape=%s quant_mode=%d global_bs=%d",
+                self._zb_dispatch_calls,
+                self.ep_rank_id,
+                tuple(hidden_states.shape),
+                tuple(bundle.expand_x_out.shape),
+                quant_mode,
+                self.global_bs,
+            )
 
         shmem_moe_distribute_dispatch_zero_buffer(
             x=hidden_states,
@@ -567,6 +618,20 @@ class TokenDispatcherWithMC2(MoETokenDispatcher[MoEMC2CombineMetadata]):
             dtype=torch.bfloat16,
             device=hidden_states.device,
         )
+
+        self._zb_combine_calls += 1
+        if self._should_log_zb_call(self._zb_combine_calls):
+            logger.info(
+                "ZB SHMEM combine call #%d: ep_rank=%d ori_x_shape=%s "
+                "combine_x_shape=%s combined_x_shape=%s comm_quant_mode=%d global_bs=%d",
+                self._zb_combine_calls,
+                self.ep_rank_id,
+                tuple(hidden_states.shape),
+                tuple(bundle.combine_x.shape),
+                tuple(combined_x.shape),
+                comm_quant_mode,
+                self.global_bs,
+            )
 
         shmem_moe_distribute_combine_zero_buffer(
             expand_x=bundle.combine_x,
