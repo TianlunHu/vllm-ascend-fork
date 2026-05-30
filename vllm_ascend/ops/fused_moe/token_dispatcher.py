@@ -263,7 +263,20 @@ class TokenDispatcherWithMC2(MoETokenDispatcher[MoEMC2CombineMetadata]):
             server_ip_port=uri,
             local_mem_size=local_mem_size,
         )
+        logger.info(
+            "ZB SHMEM init starting: ep_rank=%d ep_world_size=%d uri=%s "
+            "local_mem_size=%.1fMiB",
+            self.ep_rank_id,
+            self.ep_world_size,
+            uri,
+            local_mem_size / (1024 * 1024),
+        )
+        # SHMEM init is a collective over all PEs. In serving, the first MoE
+        # forward can happen during memory profiling / graph warmup, where ranks
+        # may arrive at different times. Synchronize once before initializing.
+        torch.distributed.barrier(group=get_mc2_group().device_group)
         runtime.init()
+        torch.distributed.barrier(group=get_mc2_group().device_group)
         runtime.alloc_ext_info()
         bundle = runtime.allocate_low_latency_tensors(
             max_recv_tokens=max_recv_tokens,
