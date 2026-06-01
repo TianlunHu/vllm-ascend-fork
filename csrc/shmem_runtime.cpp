@@ -17,8 +17,14 @@
 #include "shmem_runtime.h"
 
 #include <algorithm>
+#include <cctype>
+#include <cstring>
+#include <cstdlib>
+#include <dlfcn.h>
+#include <iostream>
 #include <limits>
 #include <mutex>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -26,6 +32,7 @@
 #include "torch_npu/csrc/aten/common/from_blob.h"
 
 #ifdef VLLM_ASCEND_ENABLE_SHMEM_RUNTIME
+#include "acl/acl_rt.h"
 #include "shmem.h"
 #endif
 
@@ -68,6 +75,169 @@ int32_t fill_init_attr(int32_t rank, int32_t world_size, uint64_t local_mem_size
     attributes->comm_args = reinterpret_cast<void *>(&default_flag_uid);
     return ACLSHMEM_SUCCESS;
 }
+
+bool zb_shmem_debug_enabled()
+{
+    const char *flag = std::getenv("VLLM_ASCEND_ZB_SHMEM_DEBUG");
+    if (flag == nullptr || flag[0] == '\0') {
+        return false;
+    }
+    if (std::strcmp(flag, "0") == 0 || std::strcmp(flag, "false") == 0 || std::strcmp(flag, "False") == 0) {
+        return false;
+    }
+    return true;
+}
+
+int32_t query_aclrt_device_or_neg1()
+{
+    int32_t device_id = -1;
+    if (aclrtGetDevice(&device_id) != ACL_SUCCESS) {
+        return -1;
+    }
+    return device_id;
+}
+
+int32_t query_logic_device_id(int32_t user_device_id)
+{
+    using RtGetLogicDevIdByUserDevIdFunc = int (*)(int32_t, int32_t *);
+    static RtGetLogicDevIdByUserDevIdFunc fn =
+        reinterpret_cast<RtGetLogicDevIdByUserDevIdFunc>(dlsym(RTLD_DEFAULT, "rtGetLogicDevIdByUserDevId"));
+    if (fn == nullptr) {
+        return -1;
+    }
+    int32_t logic_device_id = -1;
+    if (fn(user_device_id, &logic_device_id) != 0) {
+        return -1;
+    }
+    return logic_device_id;
+}
+
+void log_shmem_device_context(const char *stage, int64_t rank, int64_t world_size, int32_t logical_device_id,
+                              int32_t user_device_id, int32_t aclrt_device_id, int32_t logic_device_id)
+{
+    if (!zb_shmem_debug_enabled()) {
+        return;
+    }
+    const char *visible = std::getenv("ASCEND_RT_VISIBLE_DEVICES");
+    std::cerr << "[ZB-SHMEM][device][" << stage << "]"
+              << " rank=" << rank << "/" << world_size << " logical_device_id=" << logical_device_id
+              << " user_device_id=" << user_device_id << " aclrtGetDevice=" << aclrt_device_id
+              << " rtGetLogicDevIdByUserDevId=" << logic_device_id
+              << " ASCEND_RT_VISIBLE_DEVICES="
+              << (visible != nullptr && visible[0] != '\0' ? visible : "<unset>") << std::endl;
+}
+
+int32_t resolve_user_device_id(int64_t physical_device_id, int32_t *logical_device_out)
+{
+    int32_t logical_device = 0;
+    if (logical_device_out != nullptr) {
+        *logical_device_out = -1;
+    }
+    if (aclrtGetDevice(&logical_device) != ACL_SUCCESS) {
+        TORCH_CHECK(false, "aclrtGetDevice failed while resolving SHMEM user device id");
+    }
+    if (logical_device_out != nullptr) {
+        *logical_device_out = logical_device;
+    }
+
+    if (physical_device_id >= 0) {
+        return static_cast<int32_t>(physical_device_id);
+    }
+
+    const char *visible = std::getenv("ASCEND_RT_VISIBLE_DEVICES");
+    if (visible == nullptr || visible[0] == '\0') {
+        return logical_device;
+    }
+
+    std::vector<int32_t> devices;
+    std::stringstream stream(visible);
+    std::string token;
+    while (std::getline(stream, token, ',')) {
+        token.erase(token.begin(),
+                    std::find_if(token.begin(), token.end(),
+                                 [](unsigned char ch) { return !std::isspace(ch); }));
+        token.erase(std::find_if(token.rbegin(), token.rend(),
+                                 [](unsigned char ch) { return !std::isspace(ch); })
+                        .base(),
+                    token.end());
+        if (token.empty()) {
+            continue;
+        }
+        devices.push_back(static_cast<int32_t>(std::stoi(token)));
+    }
+
+    if (logical_device >= 0 && logical_device < static_cast<int32_t>(devices.size())) {
+        return devices[logical_device];
+    }
+    return logical_device;
+}
+
+void ensure_hybm_user_device_id(int64_t physical_device_id, int64_t rank, int64_t world_size,
+                                int64_t logical_device_id)
+{
+    // aclshmem's init backend captures aclrtGetDevice() once and passes the
+    // result to hybm_init(), which treats it as a global user device id for
+    // P2P. vLLM DP workers mask ASCEND_RT_VISIBLE_DEVICES per partition, so
+    // aclrtGetDevice() returns a logical id (0..TP-1) that collides across DP.
+    // Select the global user id before the first aclshmemx_init_attr call.
+    int32_t logical_from_acl = -1;
+    const int32_t user_device_id = resolve_user_device_id(physical_device_id, &logical_from_acl);
+    const int32_t aclrt_before = query_aclrt_device_or_neg1();
+    const int32_t logic_before = aclrt_before >= 0 ? query_logic_device_id(aclrt_before) : -1;
+
+    log_shmem_device_context("pre_set_user_device", rank, world_size,
+                             static_cast<int32_t>(logical_device_id), user_device_id, aclrt_before, logic_before);
+
+    if (zb_shmem_debug_enabled() && logical_device_id >= 0 && user_device_id == logical_device_id) {
+        std::cerr << "[ZB-SHMEM][device][pre_set_user_device] rank=" << rank
+                  << " user_device_id equals logical_device_id; DP=1 / unmasked path uses "
+                     "the same id aclshmem expects."
+                  << std::endl;
+    } else if (zb_shmem_debug_enabled() && logical_device_id >= 0 &&
+               user_device_id != logical_device_id) {
+        std::cerr << "[ZB-SHMEM][device][pre_set_user_device] rank=" << rank << " remapping logical_device_id="
+                  << logical_device_id << " -> user_device_id=" << user_device_id
+                  << " for HyBM P2P (cross-DP visible-device namespace)." << std::endl;
+    }
+
+    const aclError status = aclrtSetDevice(user_device_id);
+    TORCH_CHECK(status == ACL_SUCCESS,
+                "aclrtSetDevice(user_device_id=", user_device_id,
+                ") failed before SHMEM init, status=", static_cast<int>(status),
+                ". logical_device_id=", logical_device_id,
+                ", aclrtGetDevice(before)=", aclrt_before,
+                ", ASCEND_RT_VISIBLE_DEVICES=",
+                (std::getenv("ASCEND_RT_VISIBLE_DEVICES") != nullptr
+                     ? std::getenv("ASCEND_RT_VISIBLE_DEVICES")
+                     : "<unset>"));
+
+    const int32_t aclrt_after = query_aclrt_device_or_neg1();
+    const int32_t logic_after = aclrt_after >= 0 ? query_logic_device_id(aclrt_after) : -1;
+    log_shmem_device_context("post_set_user_device", rank, world_size,
+                             static_cast<int32_t>(logical_device_id), user_device_id, aclrt_after, logic_after);
+}
+
+void restore_logical_device(int64_t logical_device_id, int64_t rank, int64_t world_size)
+{
+    if (logical_device_id < 0) {
+        return;
+    }
+
+    const int32_t aclrt_before = query_aclrt_device_or_neg1();
+    const int32_t logic_before = aclrt_before >= 0 ? query_logic_device_id(aclrt_before) : -1;
+    log_shmem_device_context("pre_restore_logical_device", rank, world_size,
+                             static_cast<int32_t>(logical_device_id), -1, aclrt_before, logic_before);
+
+    const aclError status = aclrtSetDevice(static_cast<int32_t>(logical_device_id));
+    TORCH_CHECK(status == ACL_SUCCESS,
+                "aclrtSetDevice(logical_device_id=", logical_device_id,
+                ") failed after SHMEM init, status=", static_cast<int>(status));
+
+    const int32_t aclrt_after = query_aclrt_device_or_neg1();
+    const int32_t logic_after = aclrt_after >= 0 ? query_logic_device_id(aclrt_after) : -1;
+    log_shmem_device_context("post_restore_logical_device", rank, world_size,
+                             static_cast<int32_t>(logical_device_id), -1, aclrt_after, logic_after);
+}
 #endif
 
 int64_t checked_numel(c10::ArrayRef<int64_t> shape)
@@ -107,9 +277,12 @@ void free_tensor_buffers()
 
 } // namespace
 
-int64_t zb_shmem_init(int64_t rank, int64_t world_size, int64_t local_mem_size, const std::string &server_ip_port)
+int64_t zb_shmem_init(int64_t rank, int64_t world_size, int64_t local_mem_size, const std::string &server_ip_port,
+                      int64_t physical_device_id, int64_t logical_device_id)
 {
 #ifndef VLLM_ASCEND_ENABLE_SHMEM_RUNTIME
+    (void)physical_device_id;
+    (void)logical_device_id;
     throw_shmem_unavailable();
 #else
     std::lock_guard<std::mutex> guard(g_shmem_mutex);
@@ -120,6 +293,14 @@ int64_t zb_shmem_init(int64_t rank, int64_t world_size, int64_t local_mem_size, 
     TORCH_CHECK(local_mem_size > 0, "local_mem_size must be positive, got ", local_mem_size);
 
     if (!g_initialized) {
+        if (zb_shmem_debug_enabled()) {
+            std::cerr << "[ZB-SHMEM][init] starting rank=" << rank << "/" << world_size
+                      << " local_mem_size=" << local_mem_size << " uri=" << server_ip_port
+                      << " physical_device_id=" << physical_device_id
+                      << " logical_device_id=" << logical_device_id << std::endl;
+        }
+
+        ensure_hybm_user_device_id(physical_device_id, rank, world_size, logical_device_id);
         aclshmemx_set_conf_store_tls(false, nullptr, 0);
         aclshmemx_init_attr_t attributes = {};
         int32_t status = fill_init_attr(static_cast<int32_t>(rank), static_cast<int32_t>(world_size),
@@ -127,10 +308,29 @@ int64_t zb_shmem_init(int64_t rank, int64_t world_size, int64_t local_mem_size, 
         TORCH_CHECK(status == ACLSHMEM_SUCCESS, "failed to fill SHMEM init attributes, status=", status);
 
         status = aclshmemx_init_attr(ACLSHMEMX_INIT_WITH_DEFAULT, &attributes);
+        if (status != ACLSHMEM_SUCCESS) {
+            const int32_t aclrt_now = query_aclrt_device_or_neg1();
+            const int32_t logic_now = aclrt_now >= 0 ? query_logic_device_id(aclrt_now) : -1;
+            std::cerr << "[ZB-SHMEM][init] aclshmemx_init_attr failed rank=" << rank << "/" << world_size
+                      << " status=" << status << " aclrtGetDevice=" << aclrt_now
+                      << " logicDeviceId=" << logic_now << " uri=" << server_ip_port << std::endl;
+        }
         TORCH_CHECK(status == ACLSHMEM_SUCCESS, "aclshmemx_init_attr failed, status=", status);
         TORCH_CHECK(aclshmemx_init_status() == ACLSHMEM_STATUS_IS_INITIALIZED,
                     "aclshmem runtime is not initialized after aclshmemx_init_attr");
+        restore_logical_device(logical_device_id, rank, world_size);
+
+        if (zb_shmem_debug_enabled()) {
+            const int32_t aclrt_now = query_aclrt_device_or_neg1();
+            const int32_t logic_now = aclrt_now >= 0 ? query_logic_device_id(aclrt_now) : -1;
+            std::cerr << "[ZB-SHMEM][init] success rank=" << rank << "/" << world_size
+                      << " my_pe=" << aclshmem_my_pe() << " aclrtGetDevice=" << aclrt_now
+                      << " logicDeviceId=" << logic_now << std::endl;
+        }
         g_initialized = true;
+    } else if (zb_shmem_debug_enabled()) {
+        std::cerr << "[ZB-SHMEM][init] skipped re-init rank=" << rank << "/" << world_size
+                  << " runtime already initialized, my_pe=" << aclshmem_my_pe() << std::endl;
     }
 
     return static_cast<int64_t>(aclshmem_my_pe());

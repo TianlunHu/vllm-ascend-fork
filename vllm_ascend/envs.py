@@ -124,8 +124,11 @@ env_variables: dict[str, Callable[[], Any]] = {
     # VLLM_ASCEND_ZB_SHMEM_URI.
     "VLLM_ASCEND_ENABLE_ZB_SHMEM": lambda: bool(int(os.getenv("VLLM_ASCEND_ENABLE_ZB_SHMEM", "0"))),
     # SHMEM control endpoint forwarded to aclshmemx_init_attr. Format:
-    # "tcp://<host>:<port>". Must be identical across all ranks of the EP group.
+    # "tcp://<host>:<port>". Must be identical across all MC2/EP ranks.
     "VLLM_ASCEND_ZB_SHMEM_URI": lambda: os.getenv("VLLM_ASCEND_ZB_SHMEM_URI", ""),
+    # Extra ZB SHMEM init diagnostics (device id remap, aclrtGetDevice snapshots).
+    # Set to 1/true to enable C++ stderr logs prefixed with [ZB-SHMEM].
+    "VLLM_ASCEND_ZB_SHMEM_DEBUG": lambda: os.getenv("VLLM_ASCEND_ZB_SHMEM_DEBUG", ""),
     # Whether to use MultiBlockPool for KV cache management
     "VLLM_ASCEND_APPLY_DSV4_PATCH": lambda: bool(int(os.getenv("VLLM_ASCEND_APPLY_DSV4_PATCH", "0"))),
 }

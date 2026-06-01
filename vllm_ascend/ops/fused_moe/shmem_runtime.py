@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 from dataclasses import dataclass
 from typing import Optional, Sequence
@@ -10,6 +11,8 @@ from typing import Optional, Sequence
 import torch
 
 from vllm_ascend.utils import enable_custom_op
+
+logger = logging.getLogger(__name__)
 
 # Per-rank SHMEM heap passed to aclshmemx_init_attr(local_mem_size). All subsequent
 # aclshmem_malloc / aclshmemx_calloc allocations are carved from this pool.
@@ -145,6 +148,59 @@ def _ensure_zb_op_available(op_name: str) -> None:
             "VLLM_ASCEND_ENABLE_ZB_OPS=1 to enable zero-buffer SHMEM MoE distribute ops.")
 
 
+def _zb_shmem_debug_enabled() -> bool:
+    raw = os.getenv("VLLM_ASCEND_ZB_SHMEM_DEBUG", "")
+    return raw not in ("", "0", "false", "False")
+
+
+def _parse_visible_devices() -> list[int]:
+    visible = os.getenv("ASCEND_RT_VISIBLE_DEVICES", "").strip()
+    if not visible:
+        return []
+    return [int(part.strip()) for part in visible.split(",") if part.strip()]
+
+
+def describe_zb_device_context() -> dict[str, object]:
+    """Summarize logical vs physical NPU ids for aclshmem/HyBM init diagnostics."""
+    visible_devices = _parse_visible_devices()
+    logical_device_id = int(torch.npu.current_device())
+    physical_device_id = get_zb_physical_device_id()
+    visible_raw = os.getenv("ASCEND_RT_VISIBLE_DEVICES", "")
+    needs_remap = (
+        bool(visible_devices)
+        and 0 <= logical_device_id < len(visible_devices)
+        and visible_devices[logical_device_id] != logical_device_id
+    )
+    return {
+        "logical_device_id": logical_device_id,
+        "physical_device_id": physical_device_id,
+        "visible_devices": visible_devices,
+        "ascend_rt_visible_devices": visible_raw,
+        "needs_device_remap": needs_remap,
+        "dp1_passthrough": not needs_remap,
+    }
+
+
+def get_zb_physical_device_id() -> int:
+    """Return the global user NPU id for HyBM/aclshmem P2P setup.
+
+    vLLM DP workers set ``ASCEND_RT_VISIBLE_DEVICES`` per partition, so
+    ``torch.npu.current_device()`` is a logical id (0..TP-1). aclshmem passes
+    ``aclrtGetDevice()`` to ``hybm_init()``, which expects global user ids.
+
+    When ``ASCEND_RT_VISIBLE_DEVICES`` is unset, or maps logical id N to physical
+    id N (typical DP=1 layout), this returns the same value as
+    ``torch.npu.current_device()`` and does not change runtime behavior.
+    """
+    visible_devices = _parse_visible_devices()
+    logical = int(torch.npu.current_device())
+    if not visible_devices:
+        return logical
+    if 0 <= logical < len(visible_devices):
+        return visible_devices[logical]
+    return logical
+
+
 @dataclass
 class ShmemMoERuntime:
     rank: int
@@ -157,15 +213,44 @@ class ShmemMoERuntime:
         if self.server_ip_port is None:
             self.server_ip_port = os.getenv("VLLM_ASCEND_ZB_SHMEM_URI", "")
 
-    def init(self) -> int:
+    def init(self, physical_device_id: int | None = None) -> int:
         _ensure_custom_op_loaded()
+        device_ctx = describe_zb_device_context()
+        logical_device_id = int(device_ctx["logical_device_id"])
+        if physical_device_id is None:
+            physical_device_id = int(device_ctx["physical_device_id"])
+        logger.warning(
+            "[ZB-SHMEM] zb_shmem_init request rank=%d world_size=%d logical_device_id=%d "
+            "physical_device_id=%d needs_device_remap=%s dp1_passthrough=%s "
+            "ASCEND_RT_VISIBLE_DEVICES=%r local_mem_size=%d uri=%s debug=%s",
+            self.rank,
+            self.world_size,
+            logical_device_id,
+            physical_device_id,
+            device_ctx["needs_device_remap"],
+            device_ctx["dp1_passthrough"],
+            device_ctx["ascend_rt_visible_devices"],
+            self.local_mem_size,
+            self.server_ip_port,
+            _zb_shmem_debug_enabled(),
+        )
+        if _zb_shmem_debug_enabled():
+            logger.warning("[ZB-SHMEM] device context detail: %s", device_ctx)
         actual_rank = torch.ops._C_ascend.zb_shmem_init(
             self.rank,
             self.world_size,
             self.local_mem_size,
             self.server_ip_port,
+            int(physical_device_id),
+            logical_device_id,
         )
         self.rank = int(actual_rank)
+        logger.warning(
+            "[ZB-SHMEM] zb_shmem_init done rank=%d world_size=%d my_pe=%d",
+            self.rank,
+            self.world_size,
+            self.rank,
+        )
         return self.rank
 
     def alloc(self, element_count: int, element_size: int = 1) -> int:

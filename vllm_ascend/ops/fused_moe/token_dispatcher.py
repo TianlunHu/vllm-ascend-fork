@@ -115,6 +115,7 @@ class TokenDispatcherWithMC2(MoETokenDispatcher[MoEMC2CombineMetadata]):
         self.moe_all_to_all_group_name = backend.get_hccl_comm_name(local_rank)
         self.ep_rank_id = get_mc2_group().rank_in_group
         self.ep_world_size = get_mc2_group().world_size
+        vllm_config = get_current_vllm_config()
         self.enable_dispatch_v2 = hasattr(torch_npu, "npu_moe_distribute_dispatch_v2")
         self.need_extra_args = get_ascend_device_type() in [AscendDeviceType.A3, AscendDeviceType.A5]
         self.a5_need_extra_args = get_ascend_device_type() == AscendDeviceType.A5
@@ -126,7 +127,6 @@ class TokenDispatcherWithMC2(MoETokenDispatcher[MoEMC2CombineMetadata]):
 
         # Here we need to calculate the global_bs = max_bs_per_rank * ep_world_size to execute
         # dispatch & combine operators with different input num_tokens per rank.
-        vllm_config = get_current_vllm_config()
         scheduler_config = vllm_config.scheduler_config
         compilation_config = vllm_config.compilation_config
         speculative_config = vllm_config.speculative_config
@@ -198,28 +198,6 @@ class TokenDispatcherWithMC2(MoETokenDispatcher[MoEMC2CombineMetadata]):
             raise RuntimeError(
                 "VLLM_ASCEND_ENABLE_ZB_SHMEM=1 is incompatible with enable_mc2_hierarchy_comm; "
                 "disable one of them.")
-        # ZB SHMEM relies on aclshmemx_init_attr building per-rank peer access
-        # via aclrtDeviceEnablePeerAccess(remote_user_device_id). vLLM serving
-        # masks ASCEND_RT_VISIBLE_DEVICES per-DP, so different DP workers reuse
-        # the same low device ids (0,1,...) for physically different NPUs. The
-        # MC2 group spans DP*PCP*TP, so when we hand it to aclshmem the remote
-        # device ids collide with the local ones and SHMEM init fails with
-        # status=-9 (ACLSHMEM_DL_FUNC_FAILED) at hybm_vmm_based_segment.cpp's
-        # "enable device access failed". Fail fast with a clear message until
-        # we either (a) restrict ZB to a per-DP EP group or (b) launch with a
-        # unified device-visibility namespace.
-        vllm_config = get_current_vllm_config()
-        dp_size = getattr(vllm_config.parallel_config, "data_parallel_size", 1)
-        if dp_size and dp_size > 1:
-            raise RuntimeError(
-                "VLLM_ASCEND_ENABLE_ZB_SHMEM=1 currently does not support "
-                f"data_parallel_size>1 (got data_parallel_size={dp_size}). "
-                "ZB SHMEM init crosses the per-DP device-id alias namespace "
-                "and fails inside aclshmemx_init_attr (status=-9). Re-launch "
-                "with --data-parallel-size 1 (and a larger --tensor-parallel-size "
-                "if needed), or disable ZB by unsetting "
-                "VLLM_ASCEND_ENABLE_ZB_SHMEM."
-            )
         enable_custom_op()
         ascend_ops = getattr(torch.ops, "_C_ascend", None)
         if (ascend_ops is None
@@ -252,13 +230,15 @@ class TokenDispatcherWithMC2(MoETokenDispatcher[MoEMC2CombineMetadata]):
         from vllm_ascend.ops.fused_moe.shmem_runtime import (
             ShmemMoERuntime,
             compute_low_latency_max_recv_tokens,
+            describe_zb_device_context,
             estimate_local_mem_size,
         )
 
         if moe_expert_num % self.ep_world_size != 0:
             raise RuntimeError(
-                "ZB SHMEM dispatcher requires moe_expert_num divisible by ep_world_size, "
-                f"got moe_expert_num={moe_expert_num} ep_world_size={self.ep_world_size}.")
+                "ZB SHMEM dispatcher requires moe_expert_num divisible "
+                f"by ep_world_size, got moe_expert_num={moe_expert_num} "
+                f"ep_world_size={self.ep_world_size}.")
         num_local_experts = moe_expert_num // self.ep_world_size
 
         max_recv_tokens = compute_low_latency_max_recv_tokens(
@@ -286,10 +266,11 @@ class TokenDispatcherWithMC2(MoETokenDispatcher[MoEMC2CombineMetadata]):
             server_ip_port=uri,
             local_mem_size=local_mem_size,
         )
+        device_ctx = describe_zb_device_context()
         logger.warning(
-            "[ZB-SHMEM] init starting ep_rank=%d ep_world_size=%d uri=%s "
-            "local_mem_size=%.1fMiB hidden=%d moe_expert_num=%d use_quant=%s "
-            "max_recv_tokens=%d",
+            "[ZB-SHMEM] dispatcher init starting ep_rank=%d ep_world_size=%d uri=%s "
+            "local_mem_size=%.1fMiB hidden=%d moe_expert_num=%d "
+            "use_quant=%s max_recv_tokens=%d device_ctx=%s",
             self.ep_rank_id,
             self.ep_world_size,
             uri,
@@ -298,6 +279,7 @@ class TokenDispatcherWithMC2(MoETokenDispatcher[MoEMC2CombineMetadata]):
             moe_expert_num,
             use_quant,
             max_recv_tokens,
+            device_ctx,
         )
         runtime.init()
         runtime.alloc_ext_info()
@@ -335,9 +317,9 @@ class TokenDispatcherWithMC2(MoETokenDispatcher[MoEMC2CombineMetadata]):
         self._zb_use_quant = use_quant
 
         logger.warning(
-            "[ZB-SHMEM] init done ep_rank=%d ep_world_size=%d hidden=%d "
+            "[ZB-SHMEM] dispatcher init done ep_rank=%d ep_world_size=%d hidden=%d "
             "moe_expert_num=%d use_quant=%s max_recv_tokens=%d "
-            "local_mem_size=%.1fMiB ext_info=%d",
+            "local_mem_size=%.1fMiB ext_info=%d device_ctx=%s",
             self.ep_rank_id,
             self.ep_world_size,
             hidden,
@@ -346,6 +328,7 @@ class TokenDispatcherWithMC2(MoETokenDispatcher[MoEMC2CombineMetadata]):
             max_recv_tokens,
             local_mem_size / (1024 * 1024),
             int(runtime.ext_info),
+            device_ctx,
         )
 
     def get_dispatch_mc2_kwargs(
