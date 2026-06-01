@@ -39,6 +39,7 @@ from vllm_ascend.ops.fused_moe.moe_runtime_args import (
     MoEAllGatherCombineMetadata,
     MoEAllToAllCombineMetadata,
     MoEMC2CombineMetadata,
+    MoEQuantParams,
     MoETokenDispatchInput,
     MoETokenDispatchOutput,
     TMoECombineMetadata,
@@ -422,15 +423,17 @@ class TokenDispatcherWithMC2(MoETokenDispatcher[MoEMC2CombineMetadata]):
         kwargs_mc2.update(stage1_kwargs)
         return kwargs_mc2
 
+    def _compute_comm_quant_mode(self, quant: MoEQuantParams) -> int:
+        if quant.comm_quant_mode is not None:
+            return quant.comm_quant_mode
+        if quant.dispatch_with_quant:
+            return 4 if self.a5_need_extra_args and quant.is_mxfp else 2
+        return 0
+
     def _compute_dispatch_quant_mode(
         self, token_dispatch_input: MoETokenDispatchInput
     ) -> int:
-        comm_quant_mode = token_dispatch_input.quant.comm_quant_mode
-        if comm_quant_mode is not None:
-            return comm_quant_mode
-        if token_dispatch_input.quant.dispatch_with_quant:
-            return 4 if self.a5_need_extra_args and token_dispatch_input.quant.is_mxfp else 2
-        return 0
+        return self._compute_comm_quant_mode(token_dispatch_input.quant)
 
     def _token_dispatch_zb(
         self, token_dispatch_input: MoETokenDispatchInput
@@ -654,12 +657,16 @@ class TokenDispatcherWithMC2(MoETokenDispatcher[MoEMC2CombineMetadata]):
         runtime = self._zb_runtime
 
         quant = combine_metadata.quant
-        if quant.comm_quant_mode is not None:
-            comm_quant_mode = quant.comm_quant_mode
-        elif quant.quant_type == QuantType.MXFP8:
-            comm_quant_mode = 4
-        else:
-            comm_quant_mode = 0
+        comm_quant_mode = self._compute_comm_quant_mode(quant)
+
+        # Combine tiling requires ori_x dtype == expand_x (bf16). With int8 dispatch
+        # (comm_quant_mode=2) quantized tokens live in the SHMEM window; deepep ZB
+        # combine omits ori_x in that case.
+        ori_x = (
+            bundle.expand_x_out
+            if bundle.expand_x_out.dtype == bundle.combine_x.dtype
+            else None
+        )
 
         num_combined_tokens = combine_metadata.topk_ids.shape[0]
         combined_x = torch.empty(
@@ -670,16 +677,18 @@ class TokenDispatcherWithMC2(MoETokenDispatcher[MoEMC2CombineMetadata]):
 
         self._zb_combine_calls += 1
         if self._should_log_zb_call(self._zb_combine_calls):
-            logger.info(
-                "ZB SHMEM combine call #%d: ep_rank=%d ori_x_shape=%s "
-                "combine_x_shape=%s combined_x_shape=%s comm_quant_mode=%d global_bs=%d",
+            logger.warning(
+                "[ZB-SHMEM] combine call #%d ep_rank=%d expand_x_shape=%s "
+                "ori_x_shape=%s combined_x_shape=%s comm_quant_mode=%d "
+                "global_bs=%d has_mc2_mask=%s",
                 self._zb_combine_calls,
                 self.ep_rank_id,
-                tuple(hidden_states.shape),
                 tuple(bundle.combine_x.shape),
+                None if ori_x is None else tuple(ori_x.shape),
                 tuple(combined_x.shape),
                 comm_quant_mode,
                 self.global_bs,
+                combine_metadata.mc2_mask is not None,
             )
 
         shmem_moe_distribute_combine_zero_buffer(
@@ -689,9 +698,7 @@ class TokenDispatcherWithMC2(MoETokenDispatcher[MoEMC2CombineMetadata]):
             ep_send_count=combine_metadata.ep_recv_counts,
             expert_scales=combine_metadata.topk_weights.to(torch.float32),
             combined_x=combined_x,
-            # deepep ZB combine reads dispatch output from SHMEM expand buffer,
-            # not the GMM output passed in as hidden_states.
-            ori_x=bundle.expand_x_out,
+            ori_x=ori_x,
             x_active_mask=combine_metadata.mc2_mask if self.global_bs == 0 else None,
             ep_world_size=self.ep_world_size,
             ep_rank_id=self.ep_rank_id,
