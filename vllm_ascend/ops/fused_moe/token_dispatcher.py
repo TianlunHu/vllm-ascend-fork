@@ -488,6 +488,10 @@ class TokenDispatcherWithMC2(MoETokenDispatcher[MoEMC2CombineMetadata]):
                 self._zb_max_recv_tokens,
             )
 
+        # GMM calls dispose_tensor() on the dispatch output when dynamic_scale is
+        # set; that must not touch the persistent SHMEM expand_x_out buffer.
+        expand_x_for_gmm = bundle.expand_x_out.detach()
+
         shmem_moe_distribute_dispatch_zero_buffer(
             x=hidden_states,
             expert_ids=topk_ids,
@@ -511,7 +515,7 @@ class TokenDispatcherWithMC2(MoETokenDispatcher[MoEMC2CombineMetadata]):
         )
 
         return MoETokenDispatchOutput(
-            hidden_states=bundle.expand_x_out,
+            hidden_states=expand_x_for_gmm,
             dynamic_scale=aux["dynamic_scales"] if use_quant else None,
             group_list=aux["expert_token_nums"],
             group_list_type=expert_token_nums_type,
@@ -685,7 +689,9 @@ class TokenDispatcherWithMC2(MoETokenDispatcher[MoEMC2CombineMetadata]):
             ep_send_count=combine_metadata.ep_recv_counts,
             expert_scales=combine_metadata.topk_weights.to(torch.float32),
             combined_x=combined_x,
-            ori_x=hidden_states,
+            # deepep ZB combine reads dispatch output from SHMEM expand buffer,
+            # not the GMM output passed in as hidden_states.
+            ori_x=bundle.expand_x_out,
             x_active_mask=combine_metadata.mc2_mask if self.global_bs == 0 else None,
             ep_world_size=self.ep_world_size,
             ep_rank_id=self.ep_rank_id,
