@@ -197,6 +197,28 @@ class TokenDispatcherWithMC2(MoETokenDispatcher[MoEMC2CombineMetadata]):
             raise RuntimeError(
                 "VLLM_ASCEND_ENABLE_ZB_SHMEM=1 is incompatible with enable_mc2_hierarchy_comm; "
                 "disable one of them.")
+        # ZB SHMEM relies on aclshmemx_init_attr building per-rank peer access
+        # via aclrtDeviceEnablePeerAccess(remote_user_device_id). vLLM serving
+        # masks ASCEND_RT_VISIBLE_DEVICES per-DP, so different DP workers reuse
+        # the same low device ids (0,1,...) for physically different NPUs. The
+        # MC2 group spans DP*PCP*TP, so when we hand it to aclshmem the remote
+        # device ids collide with the local ones and SHMEM init fails with
+        # status=-9 (ACLSHMEM_DL_FUNC_FAILED) at hybm_vmm_based_segment.cpp's
+        # "enable device access failed". Fail fast with a clear message until
+        # we either (a) restrict ZB to a per-DP EP group or (b) launch with a
+        # unified device-visibility namespace.
+        vllm_config = get_current_vllm_config()
+        dp_size = getattr(vllm_config.parallel_config, "data_parallel_size", 1)
+        if dp_size and dp_size > 1:
+            raise RuntimeError(
+                "VLLM_ASCEND_ENABLE_ZB_SHMEM=1 currently does not support "
+                f"data_parallel_size>1 (got data_parallel_size={dp_size}). "
+                "ZB SHMEM init crosses the per-DP device-id alias namespace "
+                "and fails inside aclshmemx_init_attr (status=-9). Re-launch "
+                "with --data-parallel-size 1 (and a larger --tensor-parallel-size "
+                "if needed), or disable ZB by unsetting "
+                "VLLM_ASCEND_ENABLE_ZB_SHMEM."
+            )
         enable_custom_op()
         ascend_ops = getattr(torch.ops, "_C_ascend", None)
         if (ascend_ops is None
@@ -263,84 +285,20 @@ class TokenDispatcherWithMC2(MoETokenDispatcher[MoEMC2CombineMetadata]):
             server_ip_port=uri,
             local_mem_size=local_mem_size,
         )
-        # Temporary diagnostics for serving bring-up. Remove before merging
-        # once the SHMEM ZB path is verified end-to-end.
-        # status=-9 (ACLSHMEM_DL_FUNC_FAILED) means dlopen/dlsym of CANN
-        # libraries failed inside aclshmemx_init_attr. To get the actual
-        # dlerror directly in the worker log, we mimic the same dlopen here
-        # via ctypes (bare-name, RTLD_NOW like the C++ code) BEFORE calling
-        # the C++ init, so any link-time failure is surfaced as a Python
-        # OSError with the real dlerror string instead of an opaque -9.
-        import ctypes
-        import os
-        ascend_home = os.environ.get("ASCEND_HOME_PATH", "")
-        ld_lib = os.environ.get("LD_LIBRARY_PATH", "")
-        # libascendcl.so is resolved through $ASCEND_HOME_PATH/lib64 in the
-        # SHMEM source; libascend_hal.so is bare-name dlopen, so it must be
-        # reachable via LD_LIBRARY_PATH / ld.so.cache (typically in
-        # /usr/local/Ascend/driver/lib64). Probe both the way SHMEM does.
-        probe_libs = []
-        if ascend_home:
-            acl_full = os.path.join(ascend_home, "lib64", "libascendcl.so")
-            probe_libs.append(("libascendcl.so", acl_full))
-        probe_libs.append(("libascend_hal.so", "libascend_hal.so"))
-        dl_results = {}
-        for label, target in probe_libs:
-            try:
-                ctypes.CDLL(target, mode=ctypes.RTLD_GLOBAL)
-                dl_results[label] = "OK"
-            except OSError as dl_err:
-                dl_results[label] = f"FAIL: {dl_err}"
         logger.warning(
-            "[ZB_SHMEM] init starting: ep_rank=%d ep_world_size=%d uri=%s "
-            "local_mem_size=%.1fMiB ASCEND_HOME_PATH=%r dl_results=%s "
-            "SHMEM_LOG_LEVEL=%r SHMEM_LOG_TO_STDOUT=%r",
+            "[ZB-SHMEM] init starting ep_rank=%d ep_world_size=%d uri=%s "
+            "local_mem_size=%.1fMiB hidden=%d moe_expert_num=%d use_quant=%s "
+            "max_recv_tokens=%d",
             self.ep_rank_id,
             self.ep_world_size,
             uri,
             local_mem_size / (1024 * 1024),
-            ascend_home,
-            dl_results,
-            os.environ.get("SHMEM_LOG_LEVEL", ""),
-            os.environ.get("SHMEM_LOG_TO_STDOUT", ""),
+            hidden,
+            moe_expert_num,
+            use_quant,
+            max_recv_tokens,
         )
-        # Log the worker's LD_LIBRARY_PATH separately because it is long.
-        logger.warning(
-            "[ZB_SHMEM] worker LD_LIBRARY_PATH on ep_rank=%d: %s",
-            self.ep_rank_id,
-            ld_lib,
-        )
-        if any(v != "OK" for v in dl_results.values()):
-            logger.error(
-                "[ZB_SHMEM] init pre-check FAILED on ep_rank=%d. Direct "
-                "ctypes.CDLL probe failed for one or more CANN libs. "
-                "aclshmemx_init_attr will return -9. Fix LD_LIBRARY_PATH "
-                "(driver lib path is required, e.g. "
-                "/usr/local/Ascend/driver/lib64) or install the missing "
-                "library, then re-run.",
-                self.ep_rank_id,
-            )
-        try:
-            runtime.init()
-        except RuntimeError as e:
-            msg = str(e)
-            if "status=-9" in msg or "DL_FUNC_FAILED" in msg:
-                logger.error(
-                    "[ZB_SHMEM] aclshmemx_init_attr returned -9 "
-                    "(ACLSHMEM_DL_FUNC_FAILED) on ep_rank=%d. See the "
-                    "[ZB_SHMEM] init starting line above for the actual "
-                    "dlerror. To also enable SHMEM's own debug log, set "
-                    "BOTH SHMEM_LOG_LEVEL=DEBUG and SHMEM_LOG_TO_STDOUT=1 "
-                    "in the launch environment (without TO_STDOUT, SHMEM "
-                    "writes to ~/shmem/log/* and you won't see it inline).",
-                    self.ep_rank_id,
-                )
-            raise
-        logger.warning(
-            "[ZB_SHMEM] runtime.init OK: ep_rank=%d actual_rank=%d",
-            self.ep_rank_id,
-            runtime.rank,
-        )
+        runtime.init()
         runtime.alloc_ext_info()
         bundle = runtime.allocate_low_latency_tensors(
             max_recv_tokens=max_recv_tokens,
@@ -375,9 +333,9 @@ class TokenDispatcherWithMC2(MoETokenDispatcher[MoEMC2CombineMetadata]):
         self._zb_moe_expert_num = moe_expert_num
         self._zb_use_quant = use_quant
 
-        logger.info(
-            "ZB SHMEM dispatch initialized: ep_rank=%d ep_world_size=%d "
-            "hidden=%d moe_expert_num=%d use_quant=%s max_recv_tokens=%d "
+        logger.warning(
+            "[ZB-SHMEM] init done ep_rank=%d ep_world_size=%d hidden=%d "
+            "moe_expert_num=%d use_quant=%s max_recv_tokens=%d "
             "local_mem_size=%.1fMiB ext_info=%d",
             self.ep_rank_id,
             self.ep_world_size,
@@ -509,15 +467,25 @@ class TokenDispatcherWithMC2(MoETokenDispatcher[MoEMC2CombineMetadata]):
 
         self._zb_dispatch_calls += 1
         if self._should_log_zb_call(self._zb_dispatch_calls):
-            logger.info(
-                "ZB SHMEM dispatch call #%d: ep_rank=%d x_shape=%s "
-                "expand_x_out_shape=%s quant_mode=%d global_bs=%d",
+            # WARNING: vLLM worker subprocesses often hide INFO; keep at
+            # WARNING until ZB serving is verified, then remove.
+            logger.warning(
+                "[ZB-SHMEM] dispatch call #%d ep_rank=%d x_shape=%s "
+                "expert_ids_shape=%s expand_x_out_shape=%s expand_x_dtype=%s "
+                "quant_mode=%d global_bs=%d expert_token_nums_type=%d "
+                "has_mc2_mask=%s moe_expert_num=%d max_recv_tokens=%d",
                 self._zb_dispatch_calls,
                 self.ep_rank_id,
                 tuple(hidden_states.shape),
+                tuple(topk_ids.shape),
                 tuple(bundle.expand_x_out.shape),
+                bundle.expand_x_out.dtype,
                 quant_mode,
                 self.global_bs,
+                expert_token_nums_type,
+                routing.mc2_mask is not None,
+                moe_expert_num,
+                self._zb_max_recv_tokens,
             )
 
         shmem_moe_distribute_dispatch_zero_buffer(
