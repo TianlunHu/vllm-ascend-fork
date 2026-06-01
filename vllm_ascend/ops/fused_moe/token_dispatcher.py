@@ -659,6 +659,20 @@ class TokenDispatcherWithMC2(MoETokenDispatcher[MoEMC2CombineMetadata]):
         quant = combine_metadata.quant
         comm_quant_mode = self._compute_comm_quant_mode(quant)
 
+        # The combine kernel gathers expert outputs via aclshmem_ptr(expand_x, …).
+        # expand_x must be the SHMEM staging buffer; GMM writes a separate tensor,
+        # so publish local expert outputs into combine_x before combine (deepep
+        # passes GMM output as expand_x; our binding uses the SHMEM combine buffer).
+        num_expert_rows = hidden_states.size(0)
+        expand_x = bundle.combine_x
+        if num_expert_rows > expand_x.size(0):
+            raise RuntimeError(
+                f"ZB SHMEM combine: GMM output rows {num_expert_rows} exceed "
+                f"combine_x capacity {expand_x.size(0)}."
+            )
+        if num_expert_rows > 0:
+            expand_x[:num_expert_rows].copy_(hidden_states)
+
         # Combine tiling requires ori_x dtype == expand_x (bf16). With int8 dispatch
         # (comm_quant_mode=2) quantized tokens live in the SHMEM window; deepep ZB
         # combine omits ori_x in that case.
@@ -667,6 +681,9 @@ class TokenDispatcherWithMC2(MoETokenDispatcher[MoEMC2CombineMetadata]):
             if bundle.expand_x_out.dtype == bundle.combine_x.dtype
             else None
         )
+        expand_scales = None
+        if comm_quant_mode == 2 and self._zb_aux is not None:
+            expand_scales = self._zb_aux.get("dynamic_scales")
 
         num_combined_tokens = combine_metadata.topk_ids.shape[0]
         combined_x = torch.empty(
@@ -678,27 +695,30 @@ class TokenDispatcherWithMC2(MoETokenDispatcher[MoEMC2CombineMetadata]):
         self._zb_combine_calls += 1
         if self._should_log_zb_call(self._zb_combine_calls):
             logger.warning(
-                "[ZB-SHMEM] combine call #%d ep_rank=%d expand_x_shape=%s "
+                "[ZB-SHMEM] combine call #%d ep_rank=%d gmm_rows=%d expand_x_shape=%s "
                 "ori_x_shape=%s combined_x_shape=%s comm_quant_mode=%d "
-                "global_bs=%d has_mc2_mask=%s",
+                "global_bs=%d has_mc2_mask=%s has_expand_scales=%s",
                 self._zb_combine_calls,
                 self.ep_rank_id,
-                tuple(bundle.combine_x.shape),
+                num_expert_rows,
+                tuple(expand_x.shape),
                 None if ori_x is None else tuple(ori_x.shape),
                 tuple(combined_x.shape),
                 comm_quant_mode,
                 self.global_bs,
                 combine_metadata.mc2_mask is not None,
+                expand_scales is not None,
             )
 
         shmem_moe_distribute_combine_zero_buffer(
-            expand_x=bundle.combine_x,
+            expand_x=expand_x,
             expert_ids=combine_metadata.topk_ids,
             assist_info_for_combine=combine_metadata.assist_info_for_combine,
             ep_send_count=combine_metadata.ep_recv_counts,
             expert_scales=combine_metadata.topk_weights.to(torch.float32),
             combined_x=combined_x,
             ori_x=ori_x,
+            expand_scales=expand_scales,
             x_active_mask=combine_metadata.mc2_mask if self.global_bs == 0 else None,
             ep_world_size=self.ep_world_size,
             ep_rank_id=self.ep_rank_id,
