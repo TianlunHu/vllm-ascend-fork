@@ -20,6 +20,7 @@
 import copy
 import gc
 import logging
+import os
 from types import NoneType
 
 import torch
@@ -254,6 +255,18 @@ class NPUWorker(WorkerBase):
         self.cache_config.num_cpu_blocks = num_cpu_blocks
 
     def _init_device(self):
+        from vllm_ascend.ops.fused_moe.zb_shmem_device_env import adjust_local_rank_for_zb_mc2
+
+        device_rank = adjust_local_rank_for_zb_mc2(self.vllm_config, self.local_rank)
+        if device_rank != self.local_rank:
+            logger.warning(
+                "[ZB-SHMEM] adjusting worker device rank local_rank=%d -> device_rank=%d "
+                "for MC2 full visible list ASCEND_RT_VISIBLE_DEVICES=%r",
+                self.local_rank,
+                device_rank,
+                os.getenv("ASCEND_RT_VISIBLE_DEVICES", ""),
+            )
+            self.local_rank = device_rank
         device = torch.device(f"npu:{self.local_rank}")
         torch.npu.set_device(device)
 

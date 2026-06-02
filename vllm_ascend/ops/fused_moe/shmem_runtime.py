@@ -10,6 +10,7 @@ from typing import Optional, Sequence
 
 import torch
 
+from vllm_ascend.ops.fused_moe.zb_shmem_device_env import parse_visible_devices
 from vllm_ascend.utils import enable_custom_op
 
 logger = logging.getLogger(__name__)
@@ -153,23 +154,20 @@ def _zb_shmem_debug_enabled() -> bool:
     return raw not in ("", "0", "false", "False")
 
 
-def _parse_visible_devices() -> list[int]:
-    visible = os.getenv("ASCEND_RT_VISIBLE_DEVICES", "").strip()
-    if not visible:
-        return []
-    return [int(part.strip()) for part in visible.split(",") if part.strip()]
-
-
 def describe_zb_device_context() -> dict[str, object]:
-    """Summarize logical vs physical NPU ids for aclshmem/HyBM init diagnostics."""
-    visible_devices = _parse_visible_devices()
+    """Summarize NPU device ids for aclshmem/HyBM init diagnostics."""
+    visible_devices = parse_visible_devices()
     logical_device_id = int(torch.npu.current_device())
-    physical_device_id = get_zb_physical_device_id()
     visible_raw = os.getenv("ASCEND_RT_VISIBLE_DEVICES", "")
     needs_remap = (
         bool(visible_devices)
         and 0 <= logical_device_id < len(visible_devices)
         and visible_devices[logical_device_id] != logical_device_id
+    )
+    physical_device_id = (
+        visible_devices[logical_device_id]
+        if needs_remap
+        else logical_device_id
     )
     return {
         "logical_device_id": logical_device_id,
@@ -182,41 +180,9 @@ def describe_zb_device_context() -> dict[str, object]:
 
 
 def get_zb_physical_device_id() -> int:
-    """Return the global user NPU id for HyBM/aclshmem P2P setup.
-
-    vLLM DP workers set ``ASCEND_RT_VISIBLE_DEVICES`` per partition, so
-    ``torch.npu.current_device()`` is a logical id (0..TP-1). aclshmem passes
-    ``aclrtGetDevice()`` to ``hybm_init()``, which expects global user ids.
-
-    When ``ASCEND_RT_VISIBLE_DEVICES`` is unset, or maps logical id N to physical
-    id N (typical DP=1 layout), this returns the same value as
-    ``torch.npu.current_device()`` and does not change runtime behavior.
-    """
-    visible_devices = _parse_visible_devices()
-    logical = int(torch.npu.current_device())
-    if not visible_devices:
-        return logical
-    if 0 <= logical < len(visible_devices):
-        return visible_devices[logical]
-    return logical
-
-
-def get_zb_mc2_visible_devices(ep_rank: int, ep_world_size: int, physical_device_id: int) -> str:
-    """Build the full MC2 physical device list for temporary SHMEM init.
-
-    vLLM DP workers only expose their TP partition in ``ASCEND_RT_VISIBLE_DEVICES``
-    (e.g. ``2,3``), but aclshmem/HyBM init needs to ``aclrtSetDevice(physical_id)``
-    where ``physical_id`` is a global user id (e.g. 2). CANN rejects that unless
-    the visible list includes the target physical id, so we temporarily expand to
-    the contiguous MC2 range during init only.
-    """
-    override = os.getenv("VLLM_ASCEND_ZB_SHMEM_MC2_VISIBLE_DEVICES", "").strip()
-    if override:
-        return override
-    device_base = physical_device_id - ep_rank
-    if device_base < 0:
-        device_base = 0
-    return ",".join(str(device_base + i) for i in range(ep_world_size))
+    """Return global user NPU id; equals ``torch.npu.current_device()`` when visible is identity-mapped."""
+    ctx = describe_zb_device_context()
+    return int(ctx["physical_device_id"])
 
 
 @dataclass
@@ -231,42 +197,24 @@ class ShmemMoERuntime:
         if self.server_ip_port is None:
             self.server_ip_port = os.getenv("VLLM_ASCEND_ZB_SHMEM_URI", "")
 
-    def init(self, physical_device_id: int | None = None) -> int:
+    def init(self) -> int:
         _ensure_custom_op_loaded()
         device_ctx = describe_zb_device_context()
-        logical_device_id = int(device_ctx["logical_device_id"])
-        if physical_device_id is None:
-            physical_device_id = int(device_ctx["physical_device_id"])
-        mc2_visible_devices = ""
-        if device_ctx["needs_device_remap"]:
-            mc2_visible_devices = get_zb_mc2_visible_devices(
-                self.rank, self.world_size, int(physical_device_id))
-        logger.warning(
-            "[ZB-SHMEM] zb_shmem_init request rank=%d world_size=%d logical_device_id=%d "
-            "physical_device_id=%d needs_device_remap=%s dp1_passthrough=%s "
-            "ASCEND_RT_VISIBLE_DEVICES=%r mc2_visible_devices=%r local_mem_size=%d uri=%s debug=%s",
-            self.rank,
-            self.world_size,
-            logical_device_id,
-            physical_device_id,
-            device_ctx["needs_device_remap"],
-            device_ctx["dp1_passthrough"],
-            device_ctx["ascend_rt_visible_devices"],
-            mc2_visible_devices,
-            self.local_mem_size,
-            self.server_ip_port,
-            _zb_shmem_debug_enabled(),
-        )
         if _zb_shmem_debug_enabled():
-            logger.warning("[ZB-SHMEM] device context detail: %s", device_ctx)
+            logger.warning(
+                "[ZB-SHMEM] zb_shmem_init request rank=%d world_size=%d device_ctx=%s "
+                "local_mem_size=%d uri=%s",
+                self.rank,
+                self.world_size,
+                device_ctx,
+                self.local_mem_size,
+                self.server_ip_port,
+            )
         actual_rank = torch.ops._C_ascend.zb_shmem_init(
             self.rank,
             self.world_size,
             self.local_mem_size,
             self.server_ip_port,
-            int(physical_device_id),
-            logical_device_id,
-            mc2_visible_devices,
         )
         self.rank = int(actual_rank)
         logger.warning(

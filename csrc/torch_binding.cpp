@@ -2384,8 +2384,7 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
              static_cast<void (*)(const at::Tensor&)>(&vllm_ascend::device_print));
 
     ops.def(
-        "zb_shmem_init(int rank, int world_size, int local_mem_size, str server_ip_port, "
-        "int physical_device_id=-1, int logical_device_id=-1, str mc2_visible_devices=\"\") -> int");
+        "zb_shmem_init(int rank, int world_size, int local_mem_size, str server_ip_port) -> int");
     ops.impl("zb_shmem_init", c10::DispatchKey::CompositeExplicitAutograd,
              &vllm_ascend::zb_shmem_init);
 

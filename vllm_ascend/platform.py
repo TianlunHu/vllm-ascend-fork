@@ -140,6 +140,11 @@ class NPUPlatform(Platform):
 
         adapt_patch(is_global_patch=True)
 
+        from vllm_ascend import envs as envs_ascend
+
+        if envs_ascend.VLLM_ASCEND_ENABLE_ZB_SHMEM:
+            import vllm_ascend.patch.platform.patch_zb_shmem  # noqa: F401
+
         # For online serving, "ascend" quantization method is not a choice natively,
         # so we need to add "ascend" quantization method to quantization methods list
         # and the user can enable quantization using "vllm serve --quantization ascend".
