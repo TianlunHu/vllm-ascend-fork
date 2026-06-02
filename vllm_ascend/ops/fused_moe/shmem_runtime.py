@@ -201,6 +201,24 @@ def get_zb_physical_device_id() -> int:
     return logical
 
 
+def get_zb_mc2_visible_devices(ep_rank: int, ep_world_size: int, physical_device_id: int) -> str:
+    """Build the full MC2 physical device list for temporary SHMEM init.
+
+    vLLM DP workers only expose their TP partition in ``ASCEND_RT_VISIBLE_DEVICES``
+    (e.g. ``2,3``), but aclshmem/HyBM init needs to ``aclrtSetDevice(physical_id)``
+    where ``physical_id`` is a global user id (e.g. 2). CANN rejects that unless
+    the visible list includes the target physical id, so we temporarily expand to
+    the contiguous MC2 range during init only.
+    """
+    override = os.getenv("VLLM_ASCEND_ZB_SHMEM_MC2_VISIBLE_DEVICES", "").strip()
+    if override:
+        return override
+    device_base = physical_device_id - ep_rank
+    if device_base < 0:
+        device_base = 0
+    return ",".join(str(device_base + i) for i in range(ep_world_size))
+
+
 @dataclass
 class ShmemMoERuntime:
     rank: int
@@ -219,10 +237,14 @@ class ShmemMoERuntime:
         logical_device_id = int(device_ctx["logical_device_id"])
         if physical_device_id is None:
             physical_device_id = int(device_ctx["physical_device_id"])
+        mc2_visible_devices = ""
+        if device_ctx["needs_device_remap"]:
+            mc2_visible_devices = get_zb_mc2_visible_devices(
+                self.rank, self.world_size, int(physical_device_id))
         logger.warning(
             "[ZB-SHMEM] zb_shmem_init request rank=%d world_size=%d logical_device_id=%d "
             "physical_device_id=%d needs_device_remap=%s dp1_passthrough=%s "
-            "ASCEND_RT_VISIBLE_DEVICES=%r local_mem_size=%d uri=%s debug=%s",
+            "ASCEND_RT_VISIBLE_DEVICES=%r mc2_visible_devices=%r local_mem_size=%d uri=%s debug=%s",
             self.rank,
             self.world_size,
             logical_device_id,
@@ -230,6 +252,7 @@ class ShmemMoERuntime:
             device_ctx["needs_device_remap"],
             device_ctx["dp1_passthrough"],
             device_ctx["ascend_rt_visible_devices"],
+            mc2_visible_devices,
             self.local_mem_size,
             self.server_ip_port,
             _zb_shmem_debug_enabled(),
@@ -243,6 +266,7 @@ class ShmemMoERuntime:
             self.server_ip_port,
             int(physical_device_id),
             logical_device_id,
+            mc2_visible_devices,
         )
         self.rank = int(actual_rank)
         logger.warning(

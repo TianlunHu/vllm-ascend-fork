@@ -39,3 +39,23 @@ def test_get_zb_physical_device_id_mapping(
     assert ctx["logical_device_id"] == logical
     assert ctx["needs_device_remap"] is needs_remap
     assert ctx["dp1_passthrough"] is not needs_remap
+
+
+@pytest.mark.parametrize(
+    ("ep_rank", "ep_world_size", "physical", "expected_mc2_visible"),
+    [
+        (0, 4, 0, "0,1,2,3"),
+        (2, 4, 2, "0,1,2,3"),
+        (3, 4, 3, "0,1,2,3"),
+    ],
+)
+def test_get_zb_mc2_visible_devices(
+    ep_rank: int,
+    ep_world_size: int,
+    physical: int,
+    expected_mc2_visible: str,
+) -> None:
+    assert (
+        shmem_runtime.get_zb_mc2_visible_devices(ep_rank, ep_world_size, physical)
+        == expected_mc2_visible
+    )

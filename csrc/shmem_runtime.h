@@ -25,7 +25,8 @@
 namespace vllm_ascend {
 
 int64_t zb_shmem_init(int64_t rank, int64_t world_size, int64_t local_mem_size, const std::string &server_ip_port,
-                      int64_t physical_device_id = -1, int64_t logical_device_id = -1);
+                      int64_t physical_device_id = -1, int64_t logical_device_id = -1,
+                      const std::string &mc2_visible_devices = "");
 int64_t zb_shmem_alloc(int64_t element_count, int64_t element_size);
 at::Tensor zb_shmem_alloc_tensor(c10::ArrayRef<int64_t> shape, at::ScalarType dtype, const std::string &device);
 at::Tensor zb_shmem_alias_tensor(const at::Tensor &base, c10::ArrayRef<int64_t> shape, at::ScalarType dtype);

@@ -172,6 +172,44 @@ int32_t resolve_user_device_id(int64_t physical_device_id, int32_t *logical_devi
     return logical_device;
 }
 
+class ScopedMc2VisibleDevices {
+public:
+    explicit ScopedMc2VisibleDevices(const std::string &mc2_visible_devices, int64_t rank, int64_t world_size)
+    {
+        const char *current = std::getenv("ASCEND_RT_VISIBLE_DEVICES");
+        saved_visible_ = current != nullptr ? current : "";
+        if (mc2_visible_devices.empty() || mc2_visible_devices == saved_visible_) {
+            return;
+        }
+        active_ = true;
+        if (zb_shmem_debug_enabled()) {
+            std::cerr << "[ZB-SHMEM][device][expand_visible] rank=" << rank << "/" << world_size
+                      << " ASCEND_RT_VISIBLE_DEVICES: " << (saved_visible_.empty() ? "<unset>" : saved_visible_)
+                      << " -> " << mc2_visible_devices << std::endl;
+        }
+        setenv("ASCEND_RT_VISIBLE_DEVICES", mc2_visible_devices.c_str(), 1);
+    }
+
+    ~ScopedMc2VisibleDevices()
+    {
+        if (!active_) {
+            return;
+        }
+        if (saved_visible_.empty()) {
+            unsetenv("ASCEND_RT_VISIBLE_DEVICES");
+        } else {
+            setenv("ASCEND_RT_VISIBLE_DEVICES", saved_visible_.c_str(), 1);
+        }
+    }
+
+    ScopedMc2VisibleDevices(const ScopedMc2VisibleDevices &) = delete;
+    ScopedMc2VisibleDevices &operator=(const ScopedMc2VisibleDevices &) = delete;
+
+private:
+    bool active_{false};
+    std::string saved_visible_;
+};
+
 void ensure_hybm_user_device_id(int64_t physical_device_id, int64_t rank, int64_t world_size,
                                 int64_t logical_device_id)
 {
@@ -278,11 +316,13 @@ void free_tensor_buffers()
 } // namespace
 
 int64_t zb_shmem_init(int64_t rank, int64_t world_size, int64_t local_mem_size, const std::string &server_ip_port,
-                      int64_t physical_device_id, int64_t logical_device_id)
+                      int64_t physical_device_id, int64_t logical_device_id,
+                      const std::string &mc2_visible_devices)
 {
 #ifndef VLLM_ASCEND_ENABLE_SHMEM_RUNTIME
     (void)physical_device_id;
     (void)logical_device_id;
+    (void)mc2_visible_devices;
     throw_shmem_unavailable();
 #else
     std::lock_guard<std::mutex> guard(g_shmem_mutex);
@@ -300,24 +340,28 @@ int64_t zb_shmem_init(int64_t rank, int64_t world_size, int64_t local_mem_size, 
                       << " logical_device_id=" << logical_device_id << std::endl;
         }
 
-        ensure_hybm_user_device_id(physical_device_id, rank, world_size, logical_device_id);
-        aclshmemx_set_conf_store_tls(false, nullptr, 0);
-        aclshmemx_init_attr_t attributes = {};
-        int32_t status = fill_init_attr(static_cast<int32_t>(rank), static_cast<int32_t>(world_size),
-                                        static_cast<uint64_t>(local_mem_size), server_ip_port, &attributes);
-        TORCH_CHECK(status == ACLSHMEM_SUCCESS, "failed to fill SHMEM init attributes, status=", status);
+        {
+            ScopedMc2VisibleDevices visible_guard(mc2_visible_devices, rank, world_size);
+            ensure_hybm_user_device_id(physical_device_id, rank, world_size, logical_device_id);
+            aclshmemx_set_conf_store_tls(false, nullptr, 0);
+            aclshmemx_init_attr_t attributes = {};
+            int32_t status = fill_init_attr(static_cast<int32_t>(rank), static_cast<int32_t>(world_size),
+                                            static_cast<uint64_t>(local_mem_size), server_ip_port, &attributes);
+            TORCH_CHECK(status == ACLSHMEM_SUCCESS, "failed to fill SHMEM init attributes, status=", status);
 
-        status = aclshmemx_init_attr(ACLSHMEMX_INIT_WITH_DEFAULT, &attributes);
-        if (status != ACLSHMEM_SUCCESS) {
-            const int32_t aclrt_now = query_aclrt_device_or_neg1();
-            const int32_t logic_now = aclrt_now >= 0 ? query_logic_device_id(aclrt_now) : -1;
-            std::cerr << "[ZB-SHMEM][init] aclshmemx_init_attr failed rank=" << rank << "/" << world_size
-                      << " status=" << status << " aclrtGetDevice=" << aclrt_now
-                      << " logicDeviceId=" << logic_now << " uri=" << server_ip_port << std::endl;
+            status = aclshmemx_init_attr(ACLSHMEMX_INIT_WITH_DEFAULT, &attributes);
+            if (status != ACLSHMEM_SUCCESS) {
+                const int32_t aclrt_now = query_aclrt_device_or_neg1();
+                const int32_t logic_now = aclrt_now >= 0 ? query_logic_device_id(aclrt_now) : -1;
+                std::cerr << "[ZB-SHMEM][init] aclshmemx_init_attr failed rank=" << rank << "/" << world_size
+                          << " status=" << status << " aclrtGetDevice=" << aclrt_now
+                          << " logicDeviceId=" << logic_now << " uri=" << server_ip_port
+                          << " mc2_visible_devices=" << mc2_visible_devices << std::endl;
+            }
+            TORCH_CHECK(status == ACLSHMEM_SUCCESS, "aclshmemx_init_attr failed, status=", status);
+            TORCH_CHECK(aclshmemx_init_status() == ACLSHMEM_STATUS_IS_INITIALIZED,
+                        "aclshmem runtime is not initialized after aclshmemx_init_attr");
         }
-        TORCH_CHECK(status == ACLSHMEM_SUCCESS, "aclshmemx_init_attr failed, status=", status);
-        TORCH_CHECK(aclshmemx_init_status() == ACLSHMEM_STATUS_IS_INITIALIZED,
-                    "aclshmem runtime is not initialized after aclshmemx_init_attr");
         restore_logical_device(logical_device_id, rank, world_size);
 
         if (zb_shmem_debug_enabled()) {
