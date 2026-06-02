@@ -329,6 +329,9 @@ class NPUWorker(WorkerBase):
 
         # Initialize the distributed environment.
         self._init_worker_distributed_environment()
+        # HCCL process-group creation can reset the current NPU device to 0.
+        # Re-bind before model load / profiling so tensors stay on `device`.
+        torch.npu.set_device(device)
         # Set random seed.
         set_random_seed(self.model_config.seed)
         # Initialize device properties used by triton kernels.
