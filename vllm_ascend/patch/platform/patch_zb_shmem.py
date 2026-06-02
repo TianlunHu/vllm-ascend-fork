@@ -1,7 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
 
-"""Minimal ZB SHMEM patch: swap worker Process target only when DP>1 + EP."""
+"""ZB SHMEM: hook worker spawn to expand MC2 visible devices before CANN init.
+
+Must be imported from ``patch/platform/__init__.py`` so EngineCore/worker
+subprocesses (spawn) re-apply the patch via ``adapt_patch(is_global_patch=True)``.
+"""
 
 from __future__ import annotations
 
@@ -12,8 +16,10 @@ from vllm.utils import numa_utils
 from vllm.utils.system_utils import get_mp_context
 from vllm.v1.executor.multiproc_executor import UnreadyWorkerProcHandle, WorkerProc
 
+_ZB_SHMEM_PATCHED = False
 
-def _worker_process_target(vllm_config: VllmConfig):
+
+def worker_process_target(vllm_config: VllmConfig):
     from vllm_ascend.ops.fused_moe.zb_shmem_device_env import should_use_zb_mc2_full_visible
 
     if should_use_zb_mc2_full_visible(vllm_config):
@@ -53,7 +59,7 @@ def _make_worker_process_zb_aware(*, daemon: bool):
             "inherited_fds": inherited_fds if inherited_fds is not None else [],
         }
         proc = context.Process(
-            target=_worker_process_target(vllm_config),
+            target=worker_process_target(vllm_config),
             kwargs=process_kwargs,
             name=f"VllmWorker-{rank}",
             daemon=daemon,
@@ -68,6 +74,10 @@ def _make_worker_process_zb_aware(*, daemon: bool):
 
 
 def apply_zb_shmem_worker_patch() -> None:
+    global _ZB_SHMEM_PATCHED
+    if _ZB_SHMEM_PATCHED:
+        return
+
     WorkerProc.make_worker_process = _make_worker_process_zb_aware(daemon=True)
 
     try:
@@ -77,5 +87,13 @@ def apply_zb_shmem_worker_patch() -> None:
     except ImportError:
         pass
 
+    _ZB_SHMEM_PATCHED = True
 
-apply_zb_shmem_worker_patch()
+
+def _maybe_apply_on_import() -> None:
+    raw = __import__("os").getenv("VLLM_ASCEND_ENABLE_ZB_SHMEM", "")
+    if raw not in ("", "0", "false", "False"):
+        apply_zb_shmem_worker_patch()
+
+
+_maybe_apply_on_import()

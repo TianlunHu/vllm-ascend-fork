@@ -99,6 +99,14 @@ def resolve_mc2_visible_devices(vllm_config: VllmConfig) -> str:
     return get_zb_mc2_visible_devices(0, ep_world_size, device_base)
 
 
+def is_mc2_full_visible_env(vllm_config: VllmConfig) -> bool:
+    """True when the process env already exposes the full MC2 device list."""
+    if not should_use_zb_mc2_full_visible(vllm_config):
+        return False
+    expected = resolve_mc2_visible_devices(vllm_config)
+    return os.getenv("ASCEND_RT_VISIBLE_DEVICES", "") == expected
+
+
 def apply_zb_mc2_worker_visible_env(
     vllm_config: VllmConfig,
     rank: int,
@@ -114,20 +122,19 @@ def apply_zb_mc2_worker_visible_env(
         return True
 
     os.environ["ASCEND_RT_VISIBLE_DEVICES"] = mc2_visible
-    if _env_enabled("VLLM_ASCEND_ZB_SHMEM_DEBUG"):
-        logger.warning(
-            "[ZB-SHMEM] worker pre-CANN visible expand rank=%d local_rank=%d "
-            "ASCEND_RT_VISIBLE_DEVICES: %r -> %r",
-            rank,
-            local_rank,
-            previous,
-            mc2_visible,
-        )
+    logger.warning(
+        "[ZB-SHMEM] worker pre-CANN visible expand rank=%d local_rank=%d "
+        "ASCEND_RT_VISIBLE_DEVICES: %r -> %r",
+        rank,
+        local_rank,
+        previous,
+        mc2_visible,
+    )
     return True
 
 
 def adjust_local_rank_for_zb_mc2(vllm_config: VllmConfig, local_rank: int) -> int:
-    if not should_use_zb_mc2_full_visible(vllm_config):
+    if not is_mc2_full_visible_env(vllm_config):
         return local_rank
     parallel_config = vllm_config.parallel_config
     dp_local_rank = parallel_config.data_parallel_rank_local

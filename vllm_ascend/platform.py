@@ -140,10 +140,13 @@ class NPUPlatform(Platform):
 
         adapt_patch(is_global_patch=True)
 
+        # Idempotent; subprocess entry is patch/platform/__init__.py above.
         from vllm_ascend import envs as envs_ascend
 
         if envs_ascend.VLLM_ASCEND_ENABLE_ZB_SHMEM:
-            import vllm_ascend.patch.platform.patch_zb_shmem  # noqa: F401
+            from vllm_ascend.patch.platform.patch_zb_shmem import apply_zb_shmem_worker_patch
+
+            apply_zb_shmem_worker_patch()
 
         # For online serving, "ascend" quantization method is not a choice natively,
         # so we need to add "ascend" quantization method to quantization methods list

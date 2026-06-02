@@ -112,7 +112,10 @@ def test_adjust_local_rank_for_zb_mc2(
 ) -> None:
     monkeypatch.setenv("VLLM_ASCEND_ENABLE_ZB_SHMEM", "1")
     vllm_config = _make_vllm_config(data_parallel_rank_local=1)
+    monkeypatch.setenv("ASCEND_RT_VISIBLE_DEVICES", "2,3")
+    assert device_env.adjust_local_rank_for_zb_mc2(vllm_config, local_rank=0) == 0
 
+    monkeypatch.setenv("ASCEND_RT_VISIBLE_DEVICES", "0,1,2,3")
     assert device_env.adjust_local_rank_for_zb_mc2(vllm_config, local_rank=0) == 2
     assert device_env.adjust_local_rank_for_zb_mc2(vllm_config, local_rank=1) == 3
 

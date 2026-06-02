@@ -255,7 +255,23 @@ class NPUWorker(WorkerBase):
         self.cache_config.num_cpu_blocks = num_cpu_blocks
 
     def _init_device(self):
-        from vllm_ascend.ops.fused_moe.zb_shmem_device_env import adjust_local_rank_for_zb_mc2
+        from vllm_ascend.ops.fused_moe.zb_shmem_device_env import (
+            adjust_local_rank_for_zb_mc2,
+            is_mc2_full_visible_env,
+            should_use_zb_mc2_full_visible,
+        )
+
+        if should_use_zb_mc2_full_visible(self.vllm_config) and not is_mc2_full_visible_env(
+            self.vllm_config
+        ):
+            from vllm_ascend.ops.fused_moe.zb_shmem_device_env import resolve_mc2_visible_devices
+
+            raise RuntimeError(
+                "[ZB-SHMEM] ASCEND_RT_VISIBLE_DEVICES was not expanded to the full MC2 "
+                f"list before CANN init (current={os.getenv('ASCEND_RT_VISIBLE_DEVICES', '')!r}, "
+                f"expected={resolve_mc2_visible_devices(self.vllm_config)!r}). Ensure worker "
+                "spawn uses ascend_worker_main (patch_zb_shmem loaded in this process)."
+            )
 
         device_rank = adjust_local_rank_for_zb_mc2(self.vllm_config, self.local_rank)
         if device_rank != self.local_rank:
