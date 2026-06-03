@@ -129,10 +129,8 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Extra ZB SHMEM init diagnostics (device id remap, aclrtGetDevice snapshots).
     # Set to 1/true to enable C++ stderr logs prefixed with [ZB-SHMEM].
     "VLLM_ASCEND_ZB_SHMEM_DEBUG": lambda: os.getenv("VLLM_ASCEND_ZB_SHMEM_DEBUG", ""),
-    # Optional override for the MC2 visible-device list used by DP>1 ZB SHMEM
-    # workers. vLLM expands ASCEND_RT_VISIBLE_DEVICES to this full list in each
-    # worker subprocess before CANN init (runtime setenv during SHMEM init is
-    # ineffective once CANN has started).
+    # Optional override: full physical id list for all EP ranks (length DP*TP*PP*PCP).
+    # Required when card ids are not contiguous 0..N-1; same value on every worker.
     "VLLM_ASCEND_ZB_SHMEM_MC2_VISIBLE_DEVICES": lambda: os.getenv(
         "VLLM_ASCEND_ZB_SHMEM_MC2_VISIBLE_DEVICES", ""),
     # Whether to use MultiBlockPool for KV cache management

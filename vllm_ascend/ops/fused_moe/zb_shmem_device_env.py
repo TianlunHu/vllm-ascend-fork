@@ -5,7 +5,21 @@
 
 CANN locks ``ASCEND_RT_VISIBLE_DEVICES`` at process init. For DP>1 cross-DP HyBM,
 worker subprocesses expand to the full MC2 list before ``import torch_npu``, then
-select the card via DP-adjusted ``local_rank`` (global ep rank).
+select the card via a **global EP device index** (same rule as vLLM ``gpu_worker``).
+
+General model (any DP, TP, PP, PCP on a single node)::
+
+    ep_world_size = DP * TP * PP * PCP
+    global_ep_rank = data_parallel_rank * (TP * PP * PCP) + partition_local_rank
+    device_rank = global_ep_rank   # after expand to logical 0 .. ep_world_size-1
+
+Each EngineCore still owns only ``local_world_size`` workers (partition_local_rank
+in ``0 .. TP*PP*PCP-1``); ZB aclshmem uses ``rank=global_ep_rank`` with
+``world_size=ep_world_size`` across all DP partitions.
+
+For clusters where physical ids are not ``0..N-1``, set
+``VLLM_ASCEND_ZB_SHMEM_MC2_VISIBLE_DEVICES`` to the full physical list (length
+``ep_world_size``). Multi-node DP (``nnodes_within_dp > 1``) is not enabled yet.
 """
 
 from __future__ import annotations
@@ -69,6 +83,26 @@ def should_use_zb_mc2_full_visible(vllm_config: VllmConfig) -> bool:
     return True
 
 
+def resolve_dp_device_offset(parallel_config) -> int:
+    """Global DP index used to map per-engine TP local rank -> NPU id."""
+    if parallel_config.data_parallel_size <= 1:
+        return 0
+    dp_rank = getattr(parallel_config, "data_parallel_rank", None)
+    if dp_rank is not None:
+        return int(dp_rank)
+    if parallel_config.data_parallel_rank_local is not None:
+        return int(parallel_config.data_parallel_rank_local)
+    return int(parallel_config.data_parallel_index or 0)
+
+
+def tp_pp_world_size(parallel_config) -> int:
+    return (
+        parallel_config.pipeline_parallel_size
+        * parallel_config.tensor_parallel_size
+        * parallel_config.prefill_context_parallel_size
+    )
+
+
 def resolve_mc2_visible_devices(vllm_config: VllmConfig) -> str:
     """Return the full MC2 physical device list all EP ranks must share."""
     override = os.getenv("VLLM_ASCEND_ZB_SHMEM_MC2_VISIBLE_DEVICES", "").strip()
@@ -81,17 +115,11 @@ def resolve_mc2_visible_devices(vllm_config: VllmConfig) -> str:
         return ",".join(str(device_id) for device_id in visible[:ep_world_size])
 
     parallel_config = vllm_config.parallel_config
-    dp_local_rank = parallel_config.data_parallel_rank_local
-    if dp_local_rank is None:
-        dp_local_rank = parallel_config.data_parallel_index or 0
-    tp_pp_world_size = (
-        parallel_config.pipeline_parallel_size
-        * parallel_config.tensor_parallel_size
-        * parallel_config.prefill_context_parallel_size
-    )
+    dp_offset = resolve_dp_device_offset(parallel_config)
+    tp_pp = tp_pp_world_size(parallel_config)
 
     if visible:
-        device_base = visible[0] - dp_local_rank * tp_pp_world_size
+        device_base = visible[0] - dp_offset * tp_pp
     else:
         device_base = 0
     if device_base < 0:
@@ -103,8 +131,22 @@ def is_mc2_full_visible_env(vllm_config: VllmConfig) -> bool:
     """True when the process env already exposes the full MC2 device list."""
     if not should_use_zb_mc2_full_visible(vllm_config):
         return False
+    ep_world_size = compute_ep_world_size(vllm_config)
+    visible = parse_visible_devices()
+    if len(visible) < ep_world_size:
+        return False
     expected = resolve_mc2_visible_devices(vllm_config)
-    return os.getenv("ASCEND_RT_VISIBLE_DEVICES", "") == expected
+    actual = os.getenv("ASCEND_RT_VISIBLE_DEVICES", "").strip()
+    if actual == expected:
+        return True
+    # Identity-mapped MC2 list after expand: 0..ep_world_size-1
+    return visible[:ep_world_size] == list(range(ep_world_size))
+
+
+def should_adjust_mc2_device_rank(vllm_config: VllmConfig) -> bool:
+    if not should_use_zb_mc2_full_visible(vllm_config):
+        return False
+    return len(parse_visible_devices()) >= compute_ep_world_size(vllm_config)
 
 
 def apply_zb_mc2_worker_visible_env(
@@ -133,16 +175,53 @@ def apply_zb_mc2_worker_visible_env(
     return True
 
 
-def adjust_local_rank_for_zb_mc2(vllm_config: VllmConfig, local_rank: int) -> int:
-    if not is_mc2_full_visible_env(vllm_config):
-        return local_rank
+def compute_mc2_device_rank(vllm_config: VllmConfig, partition_local_rank: int) -> int:
+    """Map per-EngineCore TP-local rank to global logical NPU id (== global EP rank)."""
+    if not should_adjust_mc2_device_rank(vllm_config):
+        return partition_local_rank
     parallel_config = vllm_config.parallel_config
-    dp_local_rank = parallel_config.data_parallel_rank_local
-    if dp_local_rank is None:
-        dp_local_rank = parallel_config.data_parallel_index or 0
-    tp_pp_world_size = (
-        parallel_config.pipeline_parallel_size
-        * parallel_config.tensor_parallel_size
-        * parallel_config.prefill_context_parallel_size
-    )
-    return local_rank + dp_local_rank * tp_pp_world_size
+    dp_offset = resolve_dp_device_offset(parallel_config)
+    return partition_local_rank + dp_offset * tp_pp_world_size(parallel_config)
+
+
+def validate_mc2_device_rank(vllm_config: VllmConfig, device_rank: int) -> None:
+    """Raise if device_rank is outside the MC2 / EP world."""
+    if not should_use_zb_mc2_full_visible(vllm_config):
+        return
+    ep_world_size = compute_ep_world_size(vllm_config)
+    visible_count = len(parse_visible_devices())
+    if device_rank < 0 or device_rank >= ep_world_size:
+        raise RuntimeError(
+            f"[ZB-SHMEM] device_rank={device_rank} out of range for ep_world_size="
+            f"{ep_world_size} (DP={vllm_config.parallel_config.data_parallel_size}, "
+            f"TP={vllm_config.parallel_config.tensor_parallel_size})"
+        )
+    if visible_count < ep_world_size:
+        raise RuntimeError(
+            f"[ZB-SHMEM] ASCEND_RT_VISIBLE_DEVICES exposes {visible_count} devices but "
+            f"ep_world_size={ep_world_size}; expand or set "
+            "VLLM_ASCEND_ZB_SHMEM_MC2_VISIBLE_DEVICES"
+        )
+
+
+def adjust_local_rank_for_zb_mc2(vllm_config: VllmConfig, local_rank: int) -> int:
+    """Alias for :func:`compute_mc2_device_rank` (partition-local rank in, device id out)."""
+    return compute_mc2_device_rank(vllm_config, local_rank)
+
+
+def describe_mc2_device_bind(vllm_config: VllmConfig, partition_local_rank: int) -> dict[str, object]:
+    parallel_config = vllm_config.parallel_config
+    ep_world_size = compute_ep_world_size(vllm_config)
+    device_rank = compute_mc2_device_rank(vllm_config, partition_local_rank)
+    return {
+        "partition_local_rank": partition_local_rank,
+        "device_rank": device_rank,
+        "global_ep_rank": device_rank,
+        "ep_world_size": ep_world_size,
+        "dp_offset": resolve_dp_device_offset(parallel_config),
+        "data_parallel_rank": getattr(parallel_config, "data_parallel_rank", None),
+        "data_parallel_rank_local": parallel_config.data_parallel_rank_local,
+        "data_parallel_index": parallel_config.data_parallel_index,
+        "visible_devices": parse_visible_devices(),
+        "ascend_rt_visible_devices": os.getenv("ASCEND_RT_VISIBLE_DEVICES", ""),
+    }

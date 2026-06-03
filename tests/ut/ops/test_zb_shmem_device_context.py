@@ -15,6 +15,7 @@ from vllm_ascend.ops.fused_moe import zb_shmem_device_env as device_env
 def _make_parallel_config(**overrides):
     defaults = dict(
         data_parallel_size=2,
+        data_parallel_rank=1,
         data_parallel_rank_local=1,
         data_parallel_index=1,
         tensor_parallel_size=2,
@@ -120,6 +121,28 @@ def test_adjust_local_rank_for_zb_mc2(
     assert device_env.adjust_local_rank_for_zb_mc2(vllm_config, local_rank=1) == 3
 
 
+def test_adjust_local_rank_uses_data_parallel_rank(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("VLLM_ASCEND_ENABLE_ZB_SHMEM", "1")
+    monkeypatch.setenv("ASCEND_RT_VISIBLE_DEVICES", "0,1,2,3")
+    vllm_config = _make_vllm_config(
+        data_parallel_rank=1,
+        data_parallel_rank_local=0,
+        data_parallel_index=0,
+    )
+    assert device_env.adjust_local_rank_for_zb_mc2(vllm_config, local_rank=0) == 2
+
+
+def test_is_mc2_full_visible_env_identity_mapped(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("VLLM_ASCEND_ENABLE_ZB_SHMEM", "1")
+    monkeypatch.setenv("ASCEND_RT_VISIBLE_DEVICES", "0,1,2,3")
+    vllm_config = _make_vllm_config()
+    assert device_env.is_mc2_full_visible_env(vllm_config) is True
+
+
 def test_should_not_expand_for_dp1(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("VLLM_ASCEND_ENABLE_ZB_SHMEM", "1")
     monkeypatch.setenv("ASCEND_RT_VISIBLE_DEVICES", "0,1")
@@ -127,3 +150,49 @@ def test_should_not_expand_for_dp1(monkeypatch: pytest.MonkeyPatch) -> None:
 
     assert device_env.should_use_zb_mc2_full_visible(vllm_config) is False
     assert device_env.apply_zb_mc2_worker_visible_env(vllm_config, rank=0, local_rank=0) is False
+
+
+@pytest.mark.parametrize(
+    ("dp_rank", "partition_local_rank", "expected_device"),
+    [
+        (0, 0, 0),
+        (0, 1, 1),
+        (1, 0, 2),
+        (1, 1, 3),
+        (2, 0, 4),
+        (2, 1, 5),
+        (3, 0, 6),
+        (3, 1, 7),
+    ],
+)
+def test_compute_mc2_device_rank_dp4_tp2(
+    monkeypatch: pytest.MonkeyPatch,
+    dp_rank: int,
+    partition_local_rank: int,
+    expected_device: int,
+) -> None:
+    """DP=4, TP=2 => ep_world_size=8; device ids 0..7 (not DP=2 specific)."""
+    monkeypatch.setenv("VLLM_ASCEND_ENABLE_ZB_SHMEM", "1")
+    monkeypatch.setenv("ASCEND_RT_VISIBLE_DEVICES", "0,1,2,3,4,5,6,7")
+    vllm_config = _make_vllm_config(
+        data_parallel_size=4,
+        data_parallel_rank=dp_rank,
+        data_parallel_rank_local=dp_rank,
+        local_world_size=2,
+    )
+    assert device_env.compute_ep_world_size(vllm_config) == 8
+    assert (
+        device_env.compute_mc2_device_rank(vllm_config, partition_local_rank)
+        == expected_device
+    )
+    device_env.validate_mc2_device_rank(vllm_config, expected_device)
+
+
+def test_validate_mc2_device_rank_rejects_out_of_range(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("VLLM_ASCEND_ENABLE_ZB_SHMEM", "1")
+    monkeypatch.setenv("ASCEND_RT_VISIBLE_DEVICES", "0,1,2,3")
+    vllm_config = _make_vllm_config(data_parallel_size=2)
+    with pytest.raises(RuntimeError, match="out of range"):
+        device_env.validate_mc2_device_rank(vllm_config, 4)
