@@ -98,22 +98,16 @@ def resolve_dp_device_offset(parallel_config) -> int:
     if dp_rank > 0:
         return dp_rank
     if dp_local_int is not None:
-        if dp_local_int > 0:
-            return dp_local_int
-        # ``data_parallel_rank_local=0`` means this EngineCore owns DP partition 0.
-        partition_base = os.getenv("VLLM_ASCEND_ZB_SHMEM_PARTITION_DEVICE_BASE", "").strip()
-        if partition_base:
-            tp_pp = tp_pp_world_size(parallel_config)
-            if tp_pp > 0 and int(partition_base) > 0:
-                return int(partition_base) // tp_pp
-        return 0
+        # ``data_parallel_rank_local`` is set by EngineCore for the owning DP
+        # partition (0 included). Do not override with partition env hints.
+        return dp_local_int
     if dp_index > 0:
         return dp_index
 
     partition_base = os.getenv("VLLM_ASCEND_ZB_SHMEM_PARTITION_DEVICE_BASE", "").strip()
     if partition_base:
         tp_pp = tp_pp_world_size(parallel_config)
-        if tp_pp > 0:
+        if tp_pp > 0 and int(partition_base) > 0:
             return int(partition_base) // tp_pp
 
     return dp_rank

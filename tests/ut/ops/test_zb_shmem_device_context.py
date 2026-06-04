@@ -92,12 +92,14 @@ def test_apply_zb_mc2_worker_visible_env_expands_before_cann(
 ) -> None:
     monkeypatch.setenv("VLLM_ASCEND_ENABLE_ZB_SHMEM", "1")
     monkeypatch.setenv("ASCEND_RT_VISIBLE_DEVICES", "2,3")
+    monkeypatch.delenv("VLLM_ASCEND_ZB_SHMEM_PARTITION_DEVICE_BASE", raising=False)
 
     vllm_config = _make_vllm_config()
     applied = device_env.apply_zb_mc2_worker_visible_env(vllm_config, rank=0, local_rank=0)
 
     assert applied is True
     assert os.getenv("ASCEND_RT_VISIBLE_DEVICES") == "0,1,2,3"
+    assert os.getenv("VLLM_ASCEND_ZB_SHMEM_PARTITION_DEVICE_BASE") == "2"
 
 
 def test_resolve_mc2_visible_devices_from_dp_partition(
@@ -152,12 +154,13 @@ def test_adjust_local_rank_when_data_parallel_rank_stale_zero(
 def test_adjust_local_rank_from_partition_device_base_env(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """When EngineCore rank fields are missing, infer DP offset from pre-expand visible."""
     monkeypatch.setenv("VLLM_ASCEND_ENABLE_ZB_SHMEM", "1")
     monkeypatch.setenv("ASCEND_RT_VISIBLE_DEVICES", "0,1,2,3")
     monkeypatch.setenv("VLLM_ASCEND_ZB_SHMEM_PARTITION_DEVICE_BASE", "2")
     vllm_config = _make_vllm_config(
         data_parallel_rank=0,
-        data_parallel_rank_local=0,
+        data_parallel_rank_local=None,
         data_parallel_index=0,
     )
     assert device_env.adjust_local_rank_for_zb_mc2(vllm_config, local_rank=0) == 2
@@ -204,6 +207,7 @@ def test_compute_mc2_device_rank_dp4_tp2(
     """DP=4, TP=2 => ep_world_size=8; device ids 0..7 (not DP=2 specific)."""
     monkeypatch.setenv("VLLM_ASCEND_ENABLE_ZB_SHMEM", "1")
     monkeypatch.setenv("ASCEND_RT_VISIBLE_DEVICES", "0,1,2,3,4,5,6,7")
+    monkeypatch.delenv("VLLM_ASCEND_ZB_SHMEM_PARTITION_DEVICE_BASE", raising=False)
     vllm_config = _make_vllm_config(
         data_parallel_size=4,
         data_parallel_rank=dp_rank,
