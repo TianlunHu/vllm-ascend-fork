@@ -17,7 +17,7 @@ def _make_parallel_config(**overrides):
         data_parallel_size=2,
         data_parallel_rank=1,
         data_parallel_rank_local=1,
-        data_parallel_index=1,
+        data_parallel_index=0,
         tensor_parallel_size=2,
         pipeline_parallel_size=1,
         prefill_context_parallel_size=1,
@@ -208,6 +208,7 @@ def test_compute_mc2_device_rank_dp4_tp2(
         data_parallel_size=4,
         data_parallel_rank=dp_rank,
         data_parallel_rank_local=dp_rank,
+        data_parallel_index=dp_rank,
         local_world_size=2,
     )
     assert device_env.compute_ep_world_size(vllm_config) == 8

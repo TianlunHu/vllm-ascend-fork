@@ -90,15 +90,23 @@ def resolve_dp_device_offset(parallel_config) -> int:
 
     dp_rank = int(getattr(parallel_config, "data_parallel_rank", 0) or 0)
     dp_local = parallel_config.data_parallel_rank_local
+    dp_local_int = int(dp_local) if dp_local is not None else None
     dp_index = int(getattr(parallel_config, "data_parallel_index", 0) or 0)
 
     # Prefer an explicitly non-zero global rank. ``data_parallel_rank`` defaults to
-    # 0 in ParallelConfig and is often left stale in worker subprocess configs even
-    # when EngineCore sets ``data_parallel_rank_local`` / ``data_parallel_index``.
+    # 0 in ParallelConfig and is often left stale in worker subprocess configs.
     if dp_rank > 0:
         return dp_rank
-    if dp_local is not None and int(dp_local) > 0:
-        return int(dp_local)
+    if dp_local_int is not None:
+        if dp_local_int > 0:
+            return dp_local_int
+        # ``data_parallel_rank_local=0`` means this EngineCore owns DP partition 0.
+        partition_base = os.getenv("VLLM_ASCEND_ZB_SHMEM_PARTITION_DEVICE_BASE", "").strip()
+        if partition_base:
+            tp_pp = tp_pp_world_size(parallel_config)
+            if tp_pp > 0 and int(partition_base) > 0:
+                return int(partition_base) // tp_pp
+        return 0
     if dp_index > 0:
         return dp_index
 
