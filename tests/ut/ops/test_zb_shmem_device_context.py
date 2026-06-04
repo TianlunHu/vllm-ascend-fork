@@ -134,6 +134,36 @@ def test_adjust_local_rank_uses_data_parallel_rank(
     assert device_env.adjust_local_rank_for_zb_mc2(vllm_config, local_rank=0) == 2
 
 
+def test_adjust_local_rank_when_data_parallel_rank_stale_zero(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Worker configs may keep data_parallel_rank=0 while rank_local/index are set."""
+    monkeypatch.setenv("VLLM_ASCEND_ENABLE_ZB_SHMEM", "1")
+    monkeypatch.setenv("ASCEND_RT_VISIBLE_DEVICES", "0,1,2,3")
+    vllm_config = _make_vllm_config(
+        data_parallel_rank=0,
+        data_parallel_rank_local=1,
+        data_parallel_index=1,
+    )
+    assert device_env.adjust_local_rank_for_zb_mc2(vllm_config, local_rank=0) == 2
+    assert device_env.adjust_local_rank_for_zb_mc2(vllm_config, local_rank=1) == 3
+
+
+def test_adjust_local_rank_from_partition_device_base_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("VLLM_ASCEND_ENABLE_ZB_SHMEM", "1")
+    monkeypatch.setenv("ASCEND_RT_VISIBLE_DEVICES", "0,1,2,3")
+    monkeypatch.setenv("VLLM_ASCEND_ZB_SHMEM_PARTITION_DEVICE_BASE", "2")
+    vllm_config = _make_vllm_config(
+        data_parallel_rank=0,
+        data_parallel_rank_local=0,
+        data_parallel_index=0,
+    )
+    assert device_env.adjust_local_rank_for_zb_mc2(vllm_config, local_rank=0) == 2
+    assert device_env.adjust_local_rank_for_zb_mc2(vllm_config, local_rank=1) == 3
+
+
 def test_is_mc2_full_visible_env_identity_mapped(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

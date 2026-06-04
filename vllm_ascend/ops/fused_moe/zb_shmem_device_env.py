@@ -87,12 +87,28 @@ def resolve_dp_device_offset(parallel_config) -> int:
     """Global DP index used to map per-engine TP local rank -> NPU id."""
     if parallel_config.data_parallel_size <= 1:
         return 0
-    dp_rank = getattr(parallel_config, "data_parallel_rank", None)
-    if dp_rank is not None:
-        return int(dp_rank)
-    if parallel_config.data_parallel_rank_local is not None:
-        return int(parallel_config.data_parallel_rank_local)
-    return int(parallel_config.data_parallel_index or 0)
+
+    dp_rank = int(getattr(parallel_config, "data_parallel_rank", 0) or 0)
+    dp_local = parallel_config.data_parallel_rank_local
+    dp_index = int(getattr(parallel_config, "data_parallel_index", 0) or 0)
+
+    # Prefer an explicitly non-zero global rank. ``data_parallel_rank`` defaults to
+    # 0 in ParallelConfig and is often left stale in worker subprocess configs even
+    # when EngineCore sets ``data_parallel_rank_local`` / ``data_parallel_index``.
+    if dp_rank > 0:
+        return dp_rank
+    if dp_local is not None and int(dp_local) > 0:
+        return int(dp_local)
+    if dp_index > 0:
+        return dp_index
+
+    partition_base = os.getenv("VLLM_ASCEND_ZB_SHMEM_PARTITION_DEVICE_BASE", "").strip()
+    if partition_base:
+        tp_pp = tp_pp_world_size(parallel_config)
+        if tp_pp > 0:
+            return int(partition_base) // tp_pp
+
+    return dp_rank
 
 
 def tp_pp_world_size(parallel_config) -> int:
@@ -160,6 +176,9 @@ def apply_zb_mc2_worker_visible_env(
 
     mc2_visible = resolve_mc2_visible_devices(vllm_config)
     previous = os.getenv("ASCEND_RT_VISIBLE_DEVICES", "")
+    visible_before = parse_visible_devices()
+    if visible_before:
+        os.environ["VLLM_ASCEND_ZB_SHMEM_PARTITION_DEVICE_BASE"] = str(visible_before[0])
     if previous == mc2_visible:
         return True
 
