@@ -642,10 +642,9 @@ class TokenDispatcherWithMC2(MoETokenDispatcher[MoEMC2CombineMetadata]):
         quant = combine_metadata.quant
         comm_quant_mode = self._compute_comm_quant_mode(quant)
 
-        # The combine kernel gathers expert outputs via aclshmem_ptr(expand_x, …).
-        # expand_x must be the SHMEM staging buffer; GMM writes a separate tensor,
-        # so publish local expert outputs into combine_x before combine (deepep
-        # passes GMM output as expand_x; our binding uses the SHMEM combine buffer).
+        # Combine reads peer data from SHMEM ``combine_x``. Local GMM output lives in
+        # a separate tensor; ``CopyValidExpandXToShmem`` copies ``ori_x`` -> ``expand_x``
+        # inside the kernel (quant and non-quant). Do not copy on the Python side.
         num_expert_rows = hidden_states.size(0)
         expand_x = bundle.combine_x
         if num_expert_rows > expand_x.size(0):
@@ -653,17 +652,8 @@ class TokenDispatcherWithMC2(MoETokenDispatcher[MoEMC2CombineMetadata]):
                 f"ZB SHMEM combine: GMM output rows {num_expert_rows} exceed "
                 f"combine_x capacity {expand_x.size(0)}."
             )
-        if num_expert_rows > 0:
-            expand_x[:num_expert_rows].copy_(hidden_states)
+        ori_x = hidden_states if num_expert_rows > 0 else None
 
-        # Combine tiling requires ori_x dtype == expand_x (bf16). With int8 dispatch
-        # (comm_quant_mode=2) quantized tokens live in the SHMEM window; deepep ZB
-        # combine omits ori_x in that case.
-        ori_x = (
-            bundle.expand_x_out
-            if bundle.expand_x_out.dtype == bundle.combine_x.dtype
-            else None
-        )
         expand_scales = None
         if comm_quant_mode == 2 and self._zb_aux is not None:
             expand_scales = self._zb_aux.get("dynamic_scales")
