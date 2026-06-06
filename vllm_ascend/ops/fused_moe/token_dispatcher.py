@@ -690,6 +690,7 @@ class TokenDispatcherWithMC2(MoETokenDispatcher[MoEMC2CombineMetadata]):
             ep_send_count=combine_metadata.ep_recv_counts,
             expert_scales=combine_metadata.topk_weights.to(torch.float32),
             combined_x=combined_x,
+            tp_send_count=combine_metadata.tp_recv_counts,
             ori_x=ori_x,
             expand_scales=expand_scales,
             x_active_mask=combine_metadata.mc2_mask if self.global_bs == 0 else None,
