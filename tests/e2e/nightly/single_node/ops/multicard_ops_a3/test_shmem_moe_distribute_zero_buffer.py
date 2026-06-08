@@ -7,34 +7,62 @@
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
-"""Correctness test for the SHMEM zero-buffer MoE distribute ops.
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Correctness and optional perf/prof tests for SHMEM zero-buffer MoE distribute ops.
 
 End-to-end ``dispatch -> combine`` round-trip on real NPUs, mirroring
-``deepep_standalone``'s ``test_fixed_correctness_low_latency`` but exercising
-the operators that were upstreamed into ``vllm-ascend-fork``:
+``deepep_standalone``'s ``test_fixed_correctness_low_latency`` / ``bench_performance_low_latency``.
 
+Operators under test:
   - ``torch.ops._C_ascend.shmem_moe_distribute_dispatch_zero_buffer``
   - ``torch.ops._C_ascend.shmem_moe_distribute_combine_zero_buffer``
 
-The local check is the same the standalone test uses: with ``x[i] = rank + 1``
-(constant per row) the combined output must equal ``x * sum_normalized_topk_weights``
-for every valid token, since the ops only move tokens around and apply the
-softmax-style weighted sum on combine.
+Optional PTA baseline (for perf comparison):
+  - ``torch_npu.npu_moe_distribute_dispatch_v2``
+  - ``torch_npu.npu_moe_distribute_combine_v2``
+
+Modes (``VLLM_ASCEND_ZB_TEST_MODE``):
+  - ``correctness`` (default): single round-trip + local verify
+  - ``bench``: NPU-event wall clock for ZB vs PTA dispatch/combine
+  - ``profile``: Kineto kernel-only timing + chrome trace export
+
+Examples:
+  # correctness (pytest default)
+  pytest tests/e2e/nightly/single_node/ops/multicard_ops_a3/test_shmem_moe_distribute_zero_buffer.py
+
+  # wall-clock + kineto comparison on A3 box
+  VLLM_ASCEND_ZB_TEST_MODE=bench \\
+    python tests/e2e/nightly/single_node/ops/multicard_ops_a3/test_shmem_moe_distribute_zero_buffer.py
+
+  VLLM_ASCEND_ZB_TEST_MODE=profile \\
+    VLLM_ASCEND_ZB_TEST_TRACE_DIR=./traces/zb_moe \\
+    python tests/e2e/nightly/single_node/ops/multicard_ops_a3/test_shmem_moe_distribute_zero_buffer.py
 
 Requires:
-  - the package built with ``VLLM_ASCEND_ENABLE_ZB_OPS=1`` so both the runtime
-    bindings and the dispatch/combine ops are registered.
-  - a reachable SHMEM control endpoint (``VLLM_ASCEND_ZB_SHMEM_URI``).
-  - an A3 box with at least ``VLLM_ASCEND_ZB_TEST_WORLD_SIZE`` NPUs (default 8).
+  - package built with ``VLLM_ASCEND_ENABLE_ZB_OPS=1``
+  - ``VLLM_ASCEND_ZB_SHMEM_URI`` reachable across EP ranks
+  - A3 with at least ``VLLM_ASCEND_ZB_TEST_WORLD_SIZE`` NPUs (default 8)
 """
 
 from __future__ import annotations
 
+import argparse
 import os
 import random
+import sys
+from dataclasses import dataclass
+from functools import partial
+from pathlib import Path
 from typing import Tuple
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 import numpy as np
+import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
@@ -48,7 +76,20 @@ from vllm_ascend.ops.fused_moe.shmem_runtime import (
 )
 from vllm_ascend.utils import enable_custom_op
 
+from zb_moe_prof_utils import (
+    SHMEM_MOE_KERNELS,
+    V2_MOE_KERNELS,
+    bench,
+    bench_kineto,
+    print_kernel_table,
+    print_wallclock_table,
+)
+
 enable_custom_op()
+
+
+def _test_mode() -> str:
+    return os.environ.get("VLLM_ASCEND_ZB_TEST_MODE", "correctness").strip().lower()
 
 
 def _shmem_server_ipport() -> str:
@@ -58,6 +99,12 @@ def _shmem_server_ipport() -> str:
 
 def _hccl_master_port() -> int:
     return int(os.environ.get("VLLM_ASCEND_ZB_TEST_HCCL_PORT", "29500"))
+
+
+def _get_group_ep(rank: int) -> str:
+    group = dist.group.WORLD
+    backend = group._get_backend(torch.device("npu"))
+    return backend.get_hccl_comm_name(rank)
 
 
 def _normalize_topk_weights(topk_weights: torch.Tensor,
@@ -75,7 +122,6 @@ def _build_fixed_inputs(
     num_experts: int,
     rank: int,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Reproduces deepep_standalone's ``build_fixed_inputs`` semantics."""
     x = torch.ones((num_tokens, hidden), dtype=torch.bfloat16,
                    device="npu") * (rank + 1)
 
@@ -102,14 +148,6 @@ def _allocate_aux_tensors(
     num_max_tokens: int,
     device: str,
 ) -> dict:
-    """Mirrors deepep_standalone's auxiliary buffer layout for the ZB path.
-
-    See ``Buffer::low_latency_dispatch`` in deep_ep_standalone/csrc/deepep/deep_ep.cpp:
-      - assist_info_for_combine (``expandIdx``): max(num_tokens*num_topk, num_max_tokens*16)
-      - expert_token_nums      (``packed_recv_count``): [num_local_experts] int64
-      - ep_recv_count                                : [num_experts * num_ranks] int32
-      - tp_recv_count                                : [1] int32
-    """
     max_size = max(num_tokens * num_topk, num_max_tokens * 16)
     return {
         "assist_info_for_combine":
@@ -122,7 +160,196 @@ def _allocate_aux_tensors(
                     device=device),
         "tp_recv_count":
         torch.empty((1, ), dtype=torch.int32, device=device),
+        "dynamic_scales":
+        torch.empty((num_max_tokens, ), dtype=torch.float32, device=device),
     }
+
+
+@dataclass
+class ZbMoeOpContext:
+    rank: int
+    world_size: int
+    num_tokens: int
+    hidden: int
+    num_topk: int
+    num_experts: int
+    num_local_experts: int
+    global_bs: int
+    num_max_tokens: int
+    device: str
+    group_ep: str
+    runtime: ShmemMoERuntime
+    bundle: object
+    aux: dict
+    x: torch.Tensor
+    topk_idx: torch.Tensor
+    topk_weights: torch.Tensor
+    combined_x: torch.Tensor
+    pta_expand_x: torch.Tensor | None = None
+    pta_assist_info: torch.Tensor | None = None
+    pta_ep_send_counts: torch.Tensor | None = None
+    pta_tp_send_counts: torch.Tensor | None = None
+    pta_expand_scales: torch.Tensor | None = None
+
+    def run_zb_dispatch(self) -> None:
+        shmem_moe_distribute_dispatch_zero_buffer(
+            x=self.x,
+            expert_ids=self.topk_idx,
+            expand_x_out=self.bundle.expand_x_out,
+            dynamic_scales_out=self.aux["dynamic_scales"],
+            assist_info_for_combine_out=self.aux["assist_info_for_combine"],
+            expert_token_nums_out=self.aux["expert_token_nums"],
+            ep_recv_count_out=self.aux["ep_recv_count"],
+            tp_recv_count_out=self.aux["tp_recv_count"],
+            ep_world_size=self.world_size,
+            ep_rank_id=self.rank,
+            moe_expert_num=self.num_experts,
+            ext_info=self.runtime.ext_info,
+            global_bs=self.global_bs,
+        )
+
+    def run_zb_combine(self) -> None:
+        shmem_moe_distribute_combine_zero_buffer(
+            expand_x=self.bundle.combine_x,
+            expert_ids=self.topk_idx,
+            assist_info_for_combine=self.aux["assist_info_for_combine"],
+            ep_send_count=self.aux["ep_recv_count"],
+            expert_scales=self.topk_weights,
+            combined_x=self.combined_x,
+            tp_send_count=self.aux["tp_recv_count"],
+            ori_x=self.bundle.expand_x_out,
+            ep_world_size=self.world_size,
+            ep_rank_id=self.rank,
+            moe_expert_num=self.num_experts,
+            ext_info=self.runtime.ext_info,
+            global_bs=self.global_bs,
+        )
+
+    def run_zb_dispatch_combine(self) -> None:
+        self.run_zb_dispatch()
+        self.run_zb_combine()
+
+    def run_pta_dispatch(self) -> None:
+        if not hasattr(torch_npu, "npu_moe_distribute_dispatch_v2"):
+            raise RuntimeError("npu_moe_distribute_dispatch_v2 unavailable on this CANN build")
+        outputs = torch_npu.npu_moe_distribute_dispatch_v2(
+            x=self.x,
+            expert_ids=self.topk_idx,
+            expert_scales=self.topk_weights,
+            group_ep=self.group_ep,
+            ep_world_size=self.world_size,
+            ep_rank_id=self.rank,
+            moe_expert_num=self.num_experts,
+            group_tp=self.group_ep,
+            tp_world_size=1,
+            tp_rank_id=0,
+            expert_shard_type=0,
+            shared_expert_rank_num=0,
+            quant_mode=0,
+            global_bs=self.global_bs,
+            expert_token_nums_type=1,
+        )
+        (
+            self.pta_expand_x,
+            _dynamic_scales,
+            self.pta_assist_info,
+            _expert_token_nums,
+            self.pta_ep_send_counts,
+            self.pta_tp_send_counts,
+            self.pta_expand_scales,
+        ) = outputs[0:7]
+
+    def run_pta_combine(self) -> None:
+        if self.pta_expand_x is None:
+            self.run_pta_dispatch()
+        assert self.pta_assist_info is not None
+        assert self.pta_ep_send_counts is not None
+        assert self.pta_tp_send_counts is not None
+        torch_npu.npu_moe_distribute_combine_v2(
+            expand_x=self.pta_expand_x,
+            expert_ids=self.topk_idx,
+            assist_info_for_combine=self.pta_assist_info,
+            ep_send_counts=self.pta_ep_send_counts,
+            expert_scales=self.topk_weights,
+            tp_send_counts=self.pta_tp_send_counts,
+            expand_scales=self.pta_expand_scales,
+            group_ep=self.group_ep,
+            ep_world_size=self.world_size,
+            ep_rank_id=self.rank,
+            moe_expert_num=self.num_experts,
+            group_tp=self.group_ep,
+            tp_world_size=1,
+            tp_rank_id=0,
+            expert_shard_type=0,
+            shared_expert_rank_num=0,
+            global_bs=self.global_bs,
+            comm_quant_mode=0,
+        )
+
+    def run_pta_dispatch_combine(self) -> None:
+        self.run_pta_dispatch()
+        self.run_pta_combine()
+
+
+def _build_context(rank: int, world_size: int) -> ZbMoeOpContext:
+    num_tokens = int(os.environ.get("VLLM_ASCEND_ZB_TEST_NUM_TOKENS", "32"))
+    hidden = int(os.environ.get("VLLM_ASCEND_ZB_TEST_HIDDEN", "2048"))
+    num_topk = int(os.environ.get("VLLM_ASCEND_ZB_TEST_NUM_TOPK", "8"))
+    num_experts = int(
+        os.environ.get("VLLM_ASCEND_ZB_TEST_NUM_EXPERTS",
+                        str(max(world_size * 2, 16))))
+    assert num_experts % world_size == 0, "num_experts must be divisible by world_size"
+    num_local_experts = num_experts // world_size
+    global_bs = num_tokens * world_size
+    num_max_tokens = global_bs * num_local_experts
+    device = f"npu:{rank}"
+
+    local_mem_size = estimate_local_mem_size(
+        num_max_tokens,
+        hidden,
+        moe_expert_num=num_experts,
+        ep_world_size=world_size,
+    )
+    runtime = ShmemMoERuntime(
+        rank=rank,
+        world_size=world_size,
+        server_ip_port=_shmem_server_ipport(),
+        local_mem_size=local_mem_size,
+    )
+    runtime.init()
+    runtime.alloc_ext_info()
+    bundle = runtime.allocate_low_latency_tensors(
+        max_recv_tokens=num_max_tokens,
+        hidden_size=hidden,
+        device=device,
+        use_quant=False,
+    )
+    aux = _allocate_aux_tensors(num_tokens, num_topk, num_experts, world_size,
+                                num_local_experts, num_max_tokens, device)
+    x, topk_idx, topk_weights = _build_fixed_inputs(num_tokens, hidden, num_topk,
+                                                    num_experts, rank)
+    combined_x = torch.empty((num_tokens, hidden), dtype=torch.bfloat16, device=device)
+
+    return ZbMoeOpContext(
+        rank=rank,
+        world_size=world_size,
+        num_tokens=num_tokens,
+        hidden=hidden,
+        num_topk=num_topk,
+        num_experts=num_experts,
+        num_local_experts=num_local_experts,
+        global_bs=global_bs,
+        num_max_tokens=num_max_tokens,
+        device=device,
+        group_ep=_get_group_ep(rank),
+        runtime=runtime,
+        bundle=bundle,
+        aux=aux,
+        x=x,
+        topk_idx=topk_idx,
+        topk_weights=topk_weights,
+        combined_x=combined_x,
+    )
 
 
 def _verify_combine_local(
@@ -134,7 +361,6 @@ def _verify_combine_local(
     atol: float = 5e-5,
     rtol: float = 5e-5,
 ) -> None:
-    """Identical to deepep_standalone's ``verify_combine_local``."""
     normalized_weights = _normalize_topk_weights(topk_weights.float(),
                                                  topk_idx)
     weight_sum = normalized_weights.sum(dim=1).view(-1, 1)
@@ -155,7 +381,6 @@ def _worker(rank: int, world_size: int, port: int,
             results: mp.SimpleQueue) -> None:
     try:
         torch_npu.npu.set_device(rank)
-
         random.seed(rank + 42)
         np.random.seed(rank + 42)
         torch.manual_seed(rank + 42)
@@ -167,126 +392,175 @@ def _worker(rank: int, world_size: int, port: int,
             init_method=f"tcp://127.0.0.1:{port}",
         )
 
-        num_tokens = int(os.environ.get("VLLM_ASCEND_ZB_TEST_NUM_TOKENS",
-                                        "32"))
-        hidden = int(os.environ.get("VLLM_ASCEND_ZB_TEST_HIDDEN", "2048"))
-        num_topk = int(os.environ.get("VLLM_ASCEND_ZB_TEST_NUM_TOPK", "8"))
-        num_experts = int(
-            os.environ.get("VLLM_ASCEND_ZB_TEST_NUM_EXPERTS",
-                           str(max(world_size * 2, 16))))
-        assert num_experts % world_size == 0, (
-            "num_experts must be divisible by world_size")
-        num_local_experts = num_experts // world_size
-
-        global_bs = num_tokens * world_size
-        num_max_tokens = global_bs * num_local_experts
-
-        device = f"npu:{rank}"
-
-        local_mem_size = estimate_local_mem_size(
-            num_max_tokens,
-            hidden,
-            moe_expert_num=num_experts,
-            ep_world_size=world_size,
-        )
-        runtime = ShmemMoERuntime(
-            rank=rank,
-            world_size=world_size,
-            server_ip_port=_shmem_server_ipport(),
-            local_mem_size=local_mem_size,
-        )
-        runtime.init()
-        runtime.alloc_ext_info()
-
-        bundle = runtime.allocate_low_latency_tensors(
-            max_recv_tokens=num_max_tokens,
-            hidden_size=hidden,
-            device=device,
-            use_quant=False,
-        )
-
-        aux = _allocate_aux_tensors(num_tokens, num_topk, num_experts,
-                                    world_size, num_local_experts,
-                                    num_max_tokens, device)
-
-        x, topk_idx, topk_weights = _build_fixed_inputs(
-            num_tokens, hidden, num_topk, num_experts, rank)
-
+        mode = _test_mode()
+        ctx = _build_context(rank, world_size)
         dist.barrier()
 
-        shmem_moe_distribute_dispatch_zero_buffer(
-            x=x,
-            expert_ids=topk_idx,
-            expand_x_out=bundle.expand_x_out,
-            dynamic_scales_out=bundle.expand_x_out.new_empty(
-                num_max_tokens, dtype=torch.float32),
-            assist_info_for_combine_out=aux["assist_info_for_combine"],
-            expert_token_nums_out=aux["expert_token_nums"],
-            ep_recv_count_out=aux["ep_recv_count"],
-            tp_recv_count_out=aux["tp_recv_count"],
-            ep_world_size=world_size,
-            ep_rank_id=rank,
-            moe_expert_num=num_experts,
-            ext_info=runtime.ext_info,
-            global_bs=global_bs,
-        )
+        if mode == "correctness":
+            _run_correctness(ctx)
+        elif mode == "bench":
+            _run_bench(ctx)
+        elif mode == "profile":
+            _run_profile(ctx)
+        else:
+            raise ValueError(f"Unknown VLLM_ASCEND_ZB_TEST_MODE={mode!r}")
 
-        torch.npu.synchronize()
-        dist.barrier()
-
-        combined_x = torch.empty((num_tokens, hidden),
-                                 dtype=torch.bfloat16,
-                                 device=device)
-
-        # Per deepep_standalone (`Buffer::low_latency_combine`):
-        #   - kernel `expandX` = SHMEM ``combine_x`` (staging area peers put into)
-        #   - kernel `oriX`   = this rank's dispatch output (``expand_x_out``)
-        #   - kernel `XOut`   = a fresh BF16 [num_tokens, hidden] tensor
-        shmem_moe_distribute_combine_zero_buffer(
-            expand_x=bundle.combine_x,
-            expert_ids=topk_idx,
-            assist_info_for_combine=aux["assist_info_for_combine"],
-            ep_send_count=aux["ep_recv_count"],
-            expert_scales=topk_weights,
-            combined_x=combined_x,
-            ori_x=bundle.expand_x_out,
-            ep_world_size=world_size,
-            ep_rank_id=rank,
-            moe_expert_num=num_experts,
-            ext_info=runtime.ext_info,
-            global_bs=global_bs,
-        )
-
-        torch.npu.synchronize()
-        dist.barrier()
-
-        _verify_combine_local(combined_x, x, topk_weights, topk_idx, rank)
-
-        runtime.finalize()
+        ctx.runtime.finalize()
         dist.destroy_process_group()
-
         results.put((rank, True, None))
     except Exception as exc:  # pragma: no cover - reported via queue
         results.put((rank, False, repr(exc)))
 
 
-@torch.inference_mode()
-def test_shmem_moe_distribute_zero_buffer_roundtrip() -> None:
+def _run_correctness(ctx: ZbMoeOpContext) -> None:
+    ctx.run_zb_dispatch()
+    torch.npu.synchronize()
+    dist.barrier()
+
+    ctx.run_zb_combine()
+    torch.npu.synchronize()
+    dist.barrier()
+
+    _verify_combine_local(ctx.combined_x, ctx.x, ctx.topk_weights, ctx.topk_idx,
+                          ctx.rank)
+
+
+def _run_bench(ctx: ZbMoeOpContext) -> None:
+    num_warmups = int(os.environ.get("VLLM_ASCEND_ZB_TEST_NUM_WARMUPS", "10"))
+    num_tests = int(os.environ.get("VLLM_ASCEND_ZB_TEST_NUM_TESTS", "100"))
+
+    # Seed combine metadata once (mirrors deepep_standalone combine-only bench).
+    ctx.run_pta_dispatch()
+    ctx.run_zb_dispatch()
+    torch.npu.synchronize()
+    dist.barrier()
+
+    zb_dispatch = bench(partial(ctx.run_zb_dispatch), num_warmups, num_tests)
+    zb_combine = bench(partial(ctx.run_zb_combine), num_warmups, num_tests)
+    pta_dispatch = bench(partial(ctx.run_pta_dispatch), num_warmups, num_tests)
+    pta_combine = bench(partial(ctx.run_pta_combine), num_warmups, num_tests)
+
+    print_wallclock_table(
+        rank=ctx.rank,
+        num_tokens=ctx.num_tokens,
+        hidden=ctx.hidden,
+        num_topk=ctx.num_topk,
+        num_experts=ctx.num_experts,
+        num_ranks=ctx.world_size,
+        zb_dispatch_avg=zb_dispatch[0],
+        zb_combine_avg=zb_combine[0],
+        pta_dispatch_avg=pta_dispatch[0],
+        pta_combine_avg=pta_combine[0],
+        num_warmups=num_warmups,
+        num_tests=num_tests,
+    )
+
+    kernel_iters = min(30, num_tests)
+    zb_kernels = bench_kineto(
+        partial(ctx.run_zb_dispatch_combine),
+        kernel_names=SHMEM_MOE_KERNELS,
+        num_tests=kernel_iters,
+        suppress_kineto_output=True,
+    )
+    pta_kernels = bench_kineto(
+        partial(ctx.run_pta_dispatch_combine),
+        kernel_names=V2_MOE_KERNELS,
+        num_tests=kernel_iters,
+        suppress_kineto_output=True,
+    )
+    print_kernel_table(
+        rank=ctx.rank,
+        label="ZB SHMEM kernels",
+        kernel_names=SHMEM_MOE_KERNELS,
+        dispatch_t=zb_kernels[0],
+        combine_t=zb_kernels[1],
+        num_tests=kernel_iters,
+    )
+    print_kernel_table(
+        rank=ctx.rank,
+        label="PTA MC2 V2 kernels",
+        kernel_names=V2_MOE_KERNELS,
+        dispatch_t=pta_kernels[0],
+        combine_t=pta_kernels[1],
+        num_tests=kernel_iters,
+    )
+    dist.barrier()
+
+
+def _run_profile(ctx: ZbMoeOpContext) -> None:
+    num_warmups = int(os.environ.get("VLLM_ASCEND_ZB_TEST_NUM_WARMUPS", "10"))
+    num_tests = int(os.environ.get("VLLM_ASCEND_ZB_TEST_NUM_PROFILE_TESTS", "30"))
+    trace_dir = os.environ.get("VLLM_ASCEND_ZB_TEST_TRACE_DIR", "./traces/zb_moe")
+    os.makedirs(trace_dir, exist_ok=True)
+
+    for fn in (ctx.run_zb_dispatch_combine, ctx.run_pta_dispatch_combine):
+        for _ in range(num_warmups):
+            fn()
+    torch.npu.synchronize()
+    dist.barrier()
+
+    zb_trace = os.path.join(trace_dir, f"rank{ctx.rank}_zb_shmem.json")
+    pta_trace = os.path.join(trace_dir, f"rank{ctx.rank}_pta_v2.json")
+
+    zb_kernels = bench_kineto(
+        partial(ctx.run_zb_dispatch_combine),
+        kernel_names=SHMEM_MOE_KERNELS,
+        num_tests=num_tests,
+        trace_path=zb_trace,
+        suppress_kineto_output=(ctx.rank != 0),
+    )
+    dist.barrier()
+    pta_kernels = bench_kineto(
+        partial(ctx.run_pta_dispatch_combine),
+        kernel_names=V2_MOE_KERNELS,
+        num_tests=num_tests,
+        trace_path=pta_trace,
+        suppress_kineto_output=(ctx.rank != 0),
+    )
+    dist.barrier()
+
+    print_kernel_table(
+        rank=ctx.rank,
+        label="ZB SHMEM kernels",
+        kernel_names=SHMEM_MOE_KERNELS,
+        dispatch_t=zb_kernels[0],
+        combine_t=zb_kernels[1],
+        num_tests=num_tests,
+        trace_path=zb_trace,
+    )
+    print_kernel_table(
+        rank=ctx.rank,
+        label="PTA MC2 V2 kernels",
+        kernel_names=V2_MOE_KERNELS,
+        dispatch_t=pta_kernels[0],
+        combine_t=pta_kernels[1],
+        num_tests=num_tests,
+        trace_path=pta_trace,
+    )
+    if ctx.rank == 0:
+        print(
+            f"\n  Chrome traces saved under: {trace_dir}\n"
+            "  Open with chrome://tracing or Perfetto UI.\n",
+            flush=True,
+        )
+
+
+def _launch_multiprocess(world_size: int | None = None) -> None:
     if not hasattr(torch.ops._C_ascend,
                    "shmem_moe_distribute_dispatch_zero_buffer"):
         raise AssertionError(
             "shmem_moe_distribute_dispatch_zero_buffer not registered; rebuild "
             "vllm_ascend_C with VLLM_ASCEND_ENABLE_ZB_OPS=1")
 
-    world_size = int(os.environ.get("VLLM_ASCEND_ZB_TEST_WORLD_SIZE", "8"))
+    world_size = world_size or int(
+        os.environ.get("VLLM_ASCEND_ZB_TEST_WORLD_SIZE", "8"))
     port = _hccl_master_port() + random.randint(0, 10000)
     mp.set_start_method("fork", force=True)
 
     results: mp.SimpleQueue = mp.SimpleQueue()
     processes = []
     for rank in range(world_size):
-        p = mp.Process(target=_worker,
-                       args=(rank, world_size, port, results))
+        p = mp.Process(target=_worker, args=(rank, world_size, port, results))
         p.start()
         processes.append(p)
 
@@ -295,4 +569,104 @@ def test_shmem_moe_distribute_zero_buffer_roundtrip() -> None:
         p.join()
 
     failures = [(r, msg) for r, ok, msg in statuses if not ok]
-    assert not failures, f"ZB dispatch/combine failures: {failures}"
+    assert not failures, f"ZB test failures (mode={_test_mode()}): {failures}"
+
+
+@torch.inference_mode()
+def test_shmem_moe_distribute_zero_buffer_roundtrip() -> None:
+    if _test_mode() != "correctness":
+        pytest.skip(f"skip correctness test when VLLM_ASCEND_ZB_TEST_MODE={_test_mode()}")
+    _launch_multiprocess()
+
+
+@torch.inference_mode()
+@pytest.mark.skipif(
+    _test_mode() != "bench",
+    reason="set VLLM_ASCEND_ZB_TEST_MODE=bench to run wall-clock comparison",
+)
+def test_shmem_moe_distribute_zero_buffer_bench() -> None:
+    _launch_multiprocess()
+
+
+@torch.inference_mode()
+@pytest.mark.skipif(
+    _test_mode() != "profile",
+    reason="set VLLM_ASCEND_ZB_TEST_MODE=profile to export kineto traces",
+)
+def test_shmem_moe_distribute_zero_buffer_profile() -> None:
+    _launch_multiprocess()
+
+
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="SHMEM zero-buffer MoE dispatch/combine correctness and perf tests")
+    parser.add_argument(
+        "--mode",
+        type=str,
+        default=os.environ.get("VLLM_ASCEND_ZB_TEST_MODE", "correctness"),
+        choices=["correctness", "bench", "profile"],
+        help="correctness | bench (wall clock + kineto summary) | profile (trace export)",
+    )
+    parser.add_argument(
+        "--world-size",
+        type=int,
+        default=int(os.environ.get("VLLM_ASCEND_ZB_TEST_WORLD_SIZE", "8")),
+    )
+    parser.add_argument(
+        "--num-tokens",
+        type=int,
+        default=int(os.environ.get("VLLM_ASCEND_ZB_TEST_NUM_TOKENS", "32")),
+    )
+    parser.add_argument(
+        "--hidden",
+        type=int,
+        default=int(os.environ.get("VLLM_ASCEND_ZB_TEST_HIDDEN", "2048")),
+    )
+    parser.add_argument(
+        "--num-topk",
+        type=int,
+        default=int(os.environ.get("VLLM_ASCEND_ZB_TEST_NUM_TOPK", "8")),
+    )
+    parser.add_argument(
+        "--num-experts",
+        type=int,
+        default=None,
+        help="defaults to max(world_size * 2, 16)",
+    )
+    parser.add_argument(
+        "--num-warmups",
+        type=int,
+        default=int(os.environ.get("VLLM_ASCEND_ZB_TEST_NUM_WARMUPS", "10")),
+    )
+    parser.add_argument(
+        "--num-tests",
+        type=int,
+        default=int(os.environ.get("VLLM_ASCEND_ZB_TEST_NUM_TESTS", "100")),
+    )
+    parser.add_argument(
+        "--num-profile-tests",
+        type=int,
+        default=int(os.environ.get("VLLM_ASCEND_ZB_TEST_NUM_PROFILE_TESTS", "30")),
+    )
+    parser.add_argument(
+        "--trace-dir",
+        type=str,
+        default=os.environ.get("VLLM_ASCEND_ZB_TEST_TRACE_DIR", "./traces/zb_moe"),
+    )
+    return parser.parse_args()
+
+
+if __name__ == "__main__":
+    args = _parse_args()
+    os.environ["VLLM_ASCEND_ZB_TEST_MODE"] = args.mode
+    os.environ["VLLM_ASCEND_ZB_TEST_WORLD_SIZE"] = str(args.world_size)
+    os.environ["VLLM_ASCEND_ZB_TEST_NUM_TOKENS"] = str(args.num_tokens)
+    os.environ["VLLM_ASCEND_ZB_TEST_HIDDEN"] = str(args.hidden)
+    os.environ["VLLM_ASCEND_ZB_TEST_NUM_TOPK"] = str(args.num_topk)
+    if args.num_experts is not None:
+        os.environ["VLLM_ASCEND_ZB_TEST_NUM_EXPERTS"] = str(args.num_experts)
+    os.environ["VLLM_ASCEND_ZB_TEST_NUM_WARMUPS"] = str(args.num_warmups)
+    os.environ["VLLM_ASCEND_ZB_TEST_NUM_TESTS"] = str(args.num_tests)
+    os.environ["VLLM_ASCEND_ZB_TEST_NUM_PROFILE_TESTS"] = str(args.num_profile_tests)
+    os.environ["VLLM_ASCEND_ZB_TEST_TRACE_DIR"] = args.trace_dir
+    _launch_multiprocess(args.world_size)
