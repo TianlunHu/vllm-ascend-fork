@@ -467,17 +467,18 @@ def _run_bench(ctx: ZbMoeOpContext) -> None:
         num_tests=num_tests,
     )
 
-    kernel_iters = min(30, num_tests)
     zb_kernels = bench_kineto(
         partial(ctx.run_zb_dispatch_combine),
         kernel_names=SHMEM_MOE_KERNELS,
-        num_tests=kernel_iters,
+        num_warmups=num_warmups,
+        num_tests=num_tests,
         suppress_kineto_output=True,
     )
     pta_kernels = bench_kineto(
         partial(ctx.run_pta_dispatch_combine),
         kernel_names=V2_MOE_KERNELS,
-        num_tests=kernel_iters,
+        num_warmups=num_warmups,
+        num_tests=num_tests,
         suppress_kineto_output=True,
     )
     print_kernel_table(
@@ -486,7 +487,8 @@ def _run_bench(ctx: ZbMoeOpContext) -> None:
         kernel_names=SHMEM_MOE_KERNELS,
         dispatch_t=zb_kernels[0],
         combine_t=zb_kernels[1],
-        num_tests=kernel_iters,
+        num_warmups=num_warmups,
+        num_tests=num_tests,
     )
     print_kernel_table(
         rank=ctx.rank,
@@ -494,22 +496,17 @@ def _run_bench(ctx: ZbMoeOpContext) -> None:
         kernel_names=V2_MOE_KERNELS,
         dispatch_t=pta_kernels[0],
         combine_t=pta_kernels[1],
-        num_tests=kernel_iters,
+        num_warmups=num_warmups,
+        num_tests=num_tests,
     )
     dist.barrier()
 
 
 def _run_profile(ctx: ZbMoeOpContext) -> None:
-    num_warmups, _ = mc2_bench_iters()
-    num_tests = mc2_profile_iters()
+    num_warmups, num_tests = mc2_bench_iters()
+    profile_iters = mc2_profile_iters()
     trace_dir = mc2_trace_dir("./traces/zb_moe")
     os.makedirs(trace_dir, exist_ok=True)
-
-    for fn in (ctx.run_zb_dispatch_combine, ctx.run_pta_dispatch_combine):
-        for _ in range(num_warmups):
-            fn()
-    torch.npu.synchronize()
-    dist.barrier()
 
     zb_root = os.path.join(trace_dir, "zb_shmem")
     pta_root = os.path.join(trace_dir, "pta_v2")
@@ -520,7 +517,8 @@ def _run_profile(ctx: ZbMoeOpContext) -> None:
         partial(ctx.run_zb_dispatch_combine),
         trace_root=zb_root,
         worker_name=zb_worker,
-        num_tests=num_tests,
+        num_warmups=num_warmups,
+        num_tests=profile_iters,
         suppress_output=(ctx.rank != 0),
     )
     dist.barrier()
@@ -528,7 +526,8 @@ def _run_profile(ctx: ZbMoeOpContext) -> None:
         partial(ctx.run_pta_dispatch_combine),
         trace_root=pta_root,
         worker_name=pta_worker,
-        num_tests=num_tests,
+        num_warmups=num_warmups,
+        num_tests=profile_iters,
         suppress_output=(ctx.rank != 0),
     )
     dist.barrier()
@@ -540,7 +539,8 @@ def _run_profile(ctx: ZbMoeOpContext) -> None:
         rank=ctx.rank,
         label="ZB SHMEM",
         trace_root=zb_root,
-        num_tests=num_tests,
+        num_warmups=num_warmups,
+        num_tests=profile_iters,
         kernel_names=SHMEM_MOE_KERNELS,
         kernel_durations=zb_summary,
     )
@@ -548,7 +548,8 @@ def _run_profile(ctx: ZbMoeOpContext) -> None:
         rank=ctx.rank,
         label="PTA MC2 V2",
         trace_root=pta_root,
-        num_tests=num_tests,
+        num_warmups=num_warmups,
+        num_tests=profile_iters,
         kernel_names=V2_MOE_KERNELS,
         kernel_durations=pta_summary,
     )

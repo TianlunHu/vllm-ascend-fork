@@ -58,8 +58,10 @@ from fused_mc2_e2e_common import (
 )
 from moe_mc2_e2e_common import (
     get_group_ep,
+    mc2_bench_iters,
     mc2_hccl_port,
     mc2_int_env,
+    mc2_profile_iters,
     mc2_shape_config,
     mc2_test_mode,
     seed_worker,
@@ -300,16 +302,7 @@ def _run_correctness(ctx: FusedMc2OpContext) -> None:
 
 
 def _run_bench(ctx: FusedMc2OpContext) -> None:
-    num_warmups = mc2_int_env(
-        f"{ENV_PREFIX}_NUM_WARMUPS",
-        "VLLM_ASCEND_ZB_TEST_NUM_WARMUPS",
-        "10",
-    )
-    num_tests = mc2_int_env(
-        f"{ENV_PREFIX}_NUM_TESTS",
-        "VLLM_ASCEND_ZB_TEST_NUM_TESTS",
-        "100",
-    )
+    num_warmups, num_tests = mc2_bench_iters()
 
     fused_stats = bench(partial(ctx.run_fused), num_warmups, num_tests)
     print_fused_mc2_wallclock_table(
@@ -327,12 +320,12 @@ def _run_bench(ctx: FusedMc2OpContext) -> None:
         num_tests=num_tests,
     )
 
-    kernel_iters = min(30, num_tests)
     kernel_name = ctx.kernel_name
     kernel_t = bench_kineto(
         partial(ctx.run_fused),
         kernel_names=kernel_name,
-        num_tests=kernel_iters,
+        num_warmups=num_warmups,
+        num_tests=num_tests,
         suppress_kineto_output=True,
     )
     print_single_kernel_table(
@@ -340,32 +333,20 @@ def _run_bench(ctx: FusedMc2OpContext) -> None:
         label=f"Fused MC2 variant={ctx.variant}",
         kernel_name=kernel_name,
         duration_t=float(kernel_t),
-        num_tests=kernel_iters,
+        num_warmups=num_warmups,
+        num_tests=num_tests,
     )
     dist.barrier()
 
 
 def _run_profile(ctx: FusedMc2OpContext) -> None:
-    num_warmups = mc2_int_env(
-        f"{ENV_PREFIX}_NUM_WARMUPS",
-        "VLLM_ASCEND_ZB_TEST_NUM_WARMUPS",
-        "10",
-    )
-    num_tests = mc2_int_env(
-        f"{ENV_PREFIX}_NUM_PROFILE_TESTS",
-        "VLLM_ASCEND_ZB_TEST_NUM_PROFILE_TESTS",
-        "30",
-    )
+    num_warmups, _ = mc2_bench_iters()
+    profile_iters = mc2_profile_iters()
     trace_dir = os.environ.get(
         f"{ENV_PREFIX}_TRACE_DIR",
         "./traces/fused_mc2_baseline",
     )
     os.makedirs(trace_dir, exist_ok=True)
-
-    for _ in range(num_warmups):
-        ctx.run_fused()
-    torch.npu.synchronize()
-    dist.barrier()
 
     suffix = "ffn_combine" if ctx.variant == 1 else "gmm_combine_decode"
     trace_root = os.path.join(trace_dir, f"fused_mc2_{suffix}")
@@ -374,7 +355,8 @@ def _run_profile(ctx: FusedMc2OpContext) -> None:
         partial(ctx.run_fused),
         trace_root=trace_root,
         worker_name=worker_name,
-        num_tests=num_tests,
+        num_warmups=num_warmups,
+        num_tests=profile_iters,
         suppress_output=(ctx.rank != 0),
     )
     dist.barrier()
@@ -385,7 +367,8 @@ def _run_profile(ctx: FusedMc2OpContext) -> None:
         rank=ctx.rank,
         label=f"Fused MC2 variant={ctx.variant}",
         trace_root=trace_root,
-        num_tests=num_tests,
+        num_warmups=num_warmups,
+        num_tests=profile_iters,
         kernel_names=(ctx.kernel_name,),
         kernel_durations=(kernel_duration,) if kernel_duration is not None else None,
     )
@@ -482,7 +465,7 @@ def _parse_args() -> argparse.Namespace:
         "--num-warmups",
         type=int,
         default=mc2_int_env(f"{ENV_PREFIX}_NUM_WARMUPS",
-                           "VLLM_ASCEND_ZB_TEST_NUM_WARMUPS", "10"),
+                           "VLLM_ASCEND_ZB_TEST_NUM_WARMUPS", "50"),
     )
     parser.add_argument(
         "--num-tests",
@@ -493,8 +476,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--num-profile-tests",
         type=int,
-        default=mc2_int_env(f"{ENV_PREFIX}_NUM_PROFILE_TESTS",
-                           "VLLM_ASCEND_ZB_TEST_NUM_PROFILE_TESTS", "30"),
+        default=mc2_profile_iters(),
     )
     parser.add_argument(
         "--trace-dir",

@@ -74,11 +74,15 @@ def _load_trace_events(trace_path: Path) -> list:
 
 def bench(
     fn: Callable[[], None],
-    num_warmups: int = 10,
+    num_warmups: int = 50,
     num_tests: int = 100,
     post_fn: Optional[Callable[[], None]] = None,
 ) -> Tuple[float, float, float]:
-    """Return (avg, min, max) wall time in seconds using NPU events."""
+    """Return (avg, min, max) wall time in seconds using NPU events.
+
+    ``num_warmups`` iterations run untimed first; only the subsequent
+    ``num_tests`` iterations contribute to avg/min/max.
+    """
     device = torch.device("npu")
     torch.npu.synchronize()
 
@@ -102,7 +106,7 @@ def bench(
         torch.npu.synchronize()
         times.append(start.elapsed_time(end) / 1e3)
 
-    samples = np.array(times[1:] if len(times) > 1 else times, dtype=np.float64)
+    samples = np.array(times, dtype=np.float64)
     return float(np.average(samples)), float(np.min(samples)), float(np.max(samples))
 
 
@@ -125,11 +129,15 @@ def profile_msprof(
     fn: Callable[[], None],
     trace_root: str,
     worker_name: str,
-    num_tests: int = 30,
+    num_warmups: int = 50,
+    num_tests: int = 100,
     suppress_output: bool = False,
     run_analyse: bool = True,
 ) -> str:
     """Capture a full Ascend/msprof trace (CPU + NPU) under ``trace_root``.
+
+    Runs ``num_warmups`` untimed iterations, then records ``num_tests`` iterations
+    inside the profiler (full msprof bundle, not kernel-filtered chrome trace).
 
     Returns the directory passed to ``tensorboard_trace_handler`` (``trace_root``).
     When ``run_analyse`` is True, runs ``torch_npu.profiler.profiler.analyse`` on
@@ -138,6 +146,10 @@ def profile_msprof(
     """
     trace_root_path = Path(trace_root)
     trace_root_path.mkdir(parents=True, exist_ok=True)
+
+    for _ in range(num_warmups):
+        fn()
+    torch.npu.synchronize()
 
     suppress = _SuppressStdoutStderr if suppress_output else _EmptySuppress
     with suppress():
@@ -245,6 +257,7 @@ def print_msprof_trace_info(
     rank: int,
     label: str,
     trace_root: str,
+    num_warmups: int,
     num_tests: int,
     kernel_names: Optional[Tuple[str, ...]] = None,
     kernel_durations: Optional[Tuple[float, ...]] = None,
@@ -256,7 +269,7 @@ def print_msprof_trace_info(
         f"\n{'=' * 80}",
         f"  msprof Trace — {label}",
         f"{'=' * 80}",
-        f"  profiler_iters={num_tests}",
+        f"  warmup={num_warmups} (untimed), profile_iters={num_tests} (recorded)",
         f"  trace_root -> {trace_root}",
         "  Bundles: <trace_root>/*_ascend_pt/",
         "  After analyse: ASCEND_PROFILER_OUTPUT/{op_statistic,kernel_details,trace_view}.csv/json",
@@ -280,23 +293,28 @@ def print_msprof_trace_info(
 def bench_kineto(
     fn: Callable[[], None],
     kernel_names: Union[str, Tuple[str, ...]],
-    num_tests: int = 30,
+    num_warmups: int = 50,
+    num_tests: int = 100,
     suppress_kineto_output: bool = False,
     trace_path: Optional[str] = None,
 ) -> Tuple[float, ...]:
-    """Profile ``fn`` and return average kernel durations in seconds."""
+    """Profile ``fn`` and return average kernel durations in seconds.
+
+    ``num_warmups`` iterations run untimed before the profiler starts; kernel
+    timings are averaged over the ``num_tests`` profiled iterations only.
+    """
+    for _ in range(num_warmups):
+        fn()
+    torch.npu.synchronize()
+
     suppress = _SuppressStdoutStderr if suppress_kineto_output else _EmptySuppress
     with suppress():
-        schedule = torch_npu.profiler.schedule(wait=1, warmup=0, active=1, repeat=1)
         with torch_npu.profiler.profile(
             activities=[torch_npu.profiler.ProfilerActivity.NPU],
-            schedule=schedule,
         ) as prof:
-            for _ in range(2):
-                for _ in range(num_tests):
-                    fn()
-                torch.npu.synchronize()
-                prof.step()
+            for _ in range(num_tests):
+                fn()
+            torch.npu.synchronize()
 
     is_tuple = isinstance(kernel_names, tuple)
     names = (kernel_names,) if isinstance(kernel_names, str) else kernel_names
@@ -316,7 +334,10 @@ def bench_kineto(
             if not events:
                 raise AssertionError(f"Kernel '{kernel_name}' not found in chrome trace")
             events = sorted(events, key=lambda event: event["ts"])
-            durations = [event["dur"] / 1e6 for event in events]
+            # One kernel launch per timed iteration; use the last ``num_tests`` events
+            # in case the trace contains stray entries from profiler setup.
+            timed_events = events[-num_tests:]
+            durations = [event["dur"] / 1e6 for event in timed_events]
             kernel_durations.append(sum(durations) / len(durations))
 
         if trace_path is not None:
@@ -363,7 +384,7 @@ def print_wallclock_table(
         f"{'=' * 80}",
         f"  num_tokens={num_tokens}, hidden={hidden}, num_topk={num_topk}, "
         f"num_experts={num_experts}, world_size={num_ranks}",
-        f"  warmup={num_warmups}, iters={num_tests}",
+        f"  warmup={num_warmups} (excluded), timed_iters={num_tests}",
         sep,
         row.format("Stage", "ZB SHMEM (ms)", "PTA V2 (ms)", "ZB speedup"),
         sep,
@@ -388,6 +409,7 @@ def print_kernel_table(
     kernel_names: Tuple[str, str],
     dispatch_t: float,
     combine_t: float,
+    num_warmups: int,
     num_tests: int,
     trace_path: Optional[str] = None,
 ) -> None:
@@ -397,7 +419,7 @@ def print_kernel_table(
         f"\n{'=' * 80}",
         f"  Kineto Kernel Timing — {label}",
         f"{'=' * 80}",
-        f"  profiler_iters={num_tests}",
+        f"  warmup={num_warmups} (excluded), timed_iters={num_tests}",
         f"  {kernel_names[0]}: {dispatch_t * 1e3:.4f} ms",
         f"  {kernel_names[1]}: {combine_t * 1e3:.4f} ms",
         f"  Total: {(dispatch_t + combine_t) * 1e3:.4f} ms",
@@ -434,7 +456,7 @@ def print_pta_baseline_wallclock_table(
         f"{'=' * 80}",
         f"  num_tokens={num_tokens}, hidden={hidden}, num_topk={num_topk}, "
         f"num_experts={num_experts}, world_size={num_ranks}",
-        f"  warmup={num_warmups}, iters={num_tests}",
+        f"  warmup={num_warmups} (excluded), timed_iters={num_tests}",
         sep,
         row.format("Stage", "PTA V2 (ms)"),
         sep,
@@ -475,7 +497,7 @@ def print_fused_mc2_wallclock_table(
         f"  kernel={kernel_label}",
         f"  num_tokens={num_tokens}, hidden={hidden}, moe_intermediate={moe_intermediate}, "
         f"num_topk={num_topk}, num_experts={num_experts}, world_size={num_ranks}",
-        f"  warmup={num_warmups}, iters={num_tests}",
+        f"  warmup={num_warmups} (excluded), timed_iters={num_tests}",
         sep,
         row.format("Fused op (dispatch+GMM+combine)", f"{fused_ms:.4f} ms"),
         f"{'=' * 80}\n",
@@ -489,6 +511,7 @@ def print_single_kernel_table(
     label: str,
     kernel_name: str,
     duration_t: float,
+    num_warmups: int,
     num_tests: int,
     trace_path: Optional[str] = None,
 ) -> None:
@@ -498,7 +521,7 @@ def print_single_kernel_table(
         f"\n{'=' * 80}",
         f"  Kineto Kernel Timing — {label}",
         f"{'=' * 80}",
-        f"  profiler_iters={num_tests}",
+        f"  warmup={num_warmups} (excluded), timed_iters={num_tests}",
         f"  {kernel_name}: {duration_t * 1e3:.4f} ms",
     ]
     if trace_path is not None:

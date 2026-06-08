@@ -45,7 +45,7 @@ def mc2_bench_iters() -> tuple[int, int]:
     warmups = mc2_int_env(
         "VLLM_ASCEND_MOE_MC2_TEST_NUM_WARMUPS",
         "VLLM_ASCEND_ZB_TEST_NUM_WARMUPS",
-        "10",
+        "50",
     )
     tests = mc2_int_env(
         "VLLM_ASCEND_MOE_MC2_TEST_NUM_TESTS",
@@ -56,10 +56,16 @@ def mc2_bench_iters() -> tuple[int, int]:
 
 
 def mc2_profile_iters() -> int:
+    tests_default = str(
+        mc2_int_env(
+            "VLLM_ASCEND_MOE_MC2_TEST_NUM_TESTS",
+            "VLLM_ASCEND_ZB_TEST_NUM_TESTS",
+            "100",
+        ))
     return mc2_int_env(
         "VLLM_ASCEND_MOE_MC2_TEST_NUM_PROFILE_TESTS",
         "VLLM_ASCEND_ZB_TEST_NUM_PROFILE_TESTS",
-        "30",
+        tests_default,
     )
 
 
