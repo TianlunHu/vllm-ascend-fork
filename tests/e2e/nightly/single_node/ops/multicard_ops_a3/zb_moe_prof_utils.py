@@ -80,34 +80,105 @@ def bench(
 ) -> Tuple[float, float, float]:
     """Return (avg, min, max) wall time in seconds using NPU events.
 
-    ``num_warmups`` iterations run untimed first; only the subsequent
-    ``num_tests`` iterations contribute to avg/min/max.
+    Runs ``num_warmups + num_tests`` iterations back-to-back in one session.
+    Only the last ``num_tests`` iterations are timed (e.g. 50 + 100 = 150 total).
     """
     device = torch.device("npu")
     torch.npu.synchronize()
 
-    cache = torch.empty(int(256e6 // 4), dtype=torch.int32, device=device)
-    for _ in range(num_warmups):
+    total_iters = num_warmups + num_tests
+    times: list[float] = []
+    for i in range(total_iters):
+        record = i >= num_warmups
+        if record:
+            start = torch.npu.Event(enable_timing=True)
+            start.record()
         fn()
-
-    cache.zero_()
-    torch.npu.synchronize()
-
-    times = []
-    for _ in range(num_tests):
-        torch.npu.synchronize()
-        start = torch.npu.Event(enable_timing=True)
-        end = torch.npu.Event(enable_timing=True)
-        start.record()
-        fn()
-        end.record()
-        if post_fn is not None:
-            post_fn()
-        torch.npu.synchronize()
-        times.append(start.elapsed_time(end) / 1e3)
+        if record:
+            end = torch.npu.Event(enable_timing=True)
+            end.record()
+            if post_fn is not None:
+                post_fn()
+            torch.npu.synchronize()
+            times.append(start.elapsed_time(end) / 1e3)
 
     samples = np.array(times, dtype=np.float64)
     return float(np.average(samples)), float(np.min(samples)), float(np.max(samples))
+
+
+def bench_moe_dispatch(
+    run_dispatch: Callable[[], None],
+    run_combine: Callable[[], None],
+    num_warmups: int = 50,
+    num_tests: int = 100,
+) -> Tuple[float, float, float]:
+    """Time dispatch only on the last ``num_tests`` of a continuous session.
+
+    Each iteration runs dispatch; combine always follows (untimed) so combine
+    metadata stays warm, matching steady-state serving.
+    """
+    torch.npu.synchronize()
+    total_iters = num_warmups + num_tests
+    times: list[float] = []
+    for i in range(total_iters):
+        record = i >= num_warmups
+        if record:
+            start = torch.npu.Event(enable_timing=True)
+            start.record()
+        run_dispatch()
+        if record:
+            end = torch.npu.Event(enable_timing=True)
+            end.record()
+        run_combine()
+        if record:
+            torch.npu.synchronize()
+            times.append(start.elapsed_time(end) / 1e3)
+
+    samples = np.array(times, dtype=np.float64)
+    return float(np.average(samples)), float(np.min(samples)), float(np.max(samples))
+
+
+def bench_moe_combine(
+    run_dispatch: Callable[[], None],
+    run_combine: Callable[[], None],
+    num_warmups: int = 50,
+    num_tests: int = 100,
+) -> Tuple[float, float, float]:
+    """Time combine only on the last ``num_tests`` of a continuous session.
+
+    Each iteration runs dispatch (untimed) then combine, keeping dispatch output
+    fresh before every combine — same as production per-token flow.
+    """
+    torch.npu.synchronize()
+    total_iters = num_warmups + num_tests
+    times: list[float] = []
+    for i in range(total_iters):
+        run_dispatch()
+        record = i >= num_warmups
+        if record:
+            start = torch.npu.Event(enable_timing=True)
+            start.record()
+        run_combine()
+        if record:
+            end = torch.npu.Event(enable_timing=True)
+            end.record()
+            torch.npu.synchronize()
+            times.append(start.elapsed_time(end) / 1e3)
+
+    samples = np.array(times, dtype=np.float64)
+    return float(np.average(samples)), float(np.min(samples)), float(np.max(samples))
+
+
+def _kernel_event_matches(event_name: object, kernel_name: str) -> bool:
+    if not isinstance(event_name, str):
+        return False
+    event_lower = event_name.lower()
+    kernel_lower = kernel_name.lower()
+    return (
+        event_lower == kernel_lower
+        or kernel_lower in event_lower
+        or event_lower in kernel_lower
+    )
 
 
 def _msprof_experimental_config():
@@ -136,13 +207,9 @@ def profile_msprof(
 ) -> str:
     """Capture a full Ascend/msprof trace (CPU + NPU) under ``trace_root``.
 
-    Runs ``num_warmups`` untimed iterations, then records ``num_tests`` iterations
-    inside the profiler (full msprof bundle, not kernel-filtered chrome trace).
-
-    Returns the directory passed to ``tensorboard_trace_handler`` (``trace_root``).
-    When ``run_analyse`` is True, runs ``torch_npu.profiler.profiler.analyse`` on
-    each ``*_ascend_pt`` bundle so ``ASCEND_PROFILER_OUTPUT/`` (op_statistic.csv,
-    kernel_details.csv, trace_view.json, ...) is generated.
+    Runs ``num_warmups + num_tests`` iterations in one continuous session.
+    Warmup iterations execute outside the profiler; the last ``num_tests``
+    iterations are recorded (full msprof bundle).
     """
     trace_root_path = Path(trace_root)
     trace_root_path.mkdir(parents=True, exist_ok=True)
@@ -269,7 +336,7 @@ def print_msprof_trace_info(
         f"\n{'=' * 80}",
         f"  msprof Trace — {label}",
         f"{'=' * 80}",
-        f"  warmup={num_warmups} (untimed), profile_iters={num_tests} (recorded)",
+        f"  warmup={num_warmups} (untimed), profile_iters={num_tests} (recorded, continuous session)",
         f"  trace_root -> {trace_root}",
         "  Bundles: <trace_root>/*_ascend_pt/",
         "  After analyse: ASCEND_PROFILER_OUTPUT/{op_statistic,kernel_details,trace_view}.csv/json",
@@ -300,19 +367,17 @@ def bench_kineto(
 ) -> Tuple[float, ...]:
     """Profile ``fn`` and return average kernel durations in seconds.
 
-    ``num_warmups`` iterations run untimed before the profiler starts; kernel
-    timings are averaged over the ``num_tests`` profiled iterations only.
+    Runs ``num_warmups + num_tests`` iterations in one continuous session inside
+    the profiler. Kernel ``dur`` values are averaged over the **last**
+    ``num_tests`` matching events per kernel (warmup iterations excluded).
     """
-    for _ in range(num_warmups):
-        fn()
-    torch.npu.synchronize()
-
+    total_iters = num_warmups + num_tests
     suppress = _SuppressStdoutStderr if suppress_kineto_output else _EmptySuppress
     with suppress():
         with torch_npu.profiler.profile(
             activities=[torch_npu.profiler.ProfilerActivity.NPU],
         ) as prof:
-            for _ in range(num_tests):
+            for _ in range(total_iters):
                 fn()
             torch.npu.synchronize()
 
@@ -329,14 +394,22 @@ def bench_kineto(
             events = [
                 event
                 for event in profile_events
-                if isinstance(event, dict) and event.get("name") == kernel_name
+                if isinstance(event, dict)
+                and _kernel_event_matches(event.get("name"), kernel_name)
             ]
             if not events:
-                raise AssertionError(f"Kernel '{kernel_name}' not found in chrome trace")
+                raise AssertionError(
+                    f"Kernel '{kernel_name}' not found in chrome trace "
+                    f"(available sample names: "
+                    f"{sorted({e.get('name') for e in profile_events if isinstance(e, dict) and e.get('name')})[:8]}...)"
+                )
             events = sorted(events, key=lambda event: event["ts"])
-            # One kernel launch per timed iteration; use the last ``num_tests`` events
-            # in case the trace contains stray entries from profiler setup.
             timed_events = events[-num_tests:]
+            if len(timed_events) < num_tests:
+                raise AssertionError(
+                    f"Kernel '{kernel_name}': expected {num_tests} timed events, "
+                    f"got {len(timed_events)} (total matched={len(events)}, "
+                    f"warmup={num_warmups})")
             durations = [event["dur"] / 1e6 for event in timed_events]
             kernel_durations.append(sum(durations) / len(durations))
 
@@ -363,6 +436,8 @@ def print_wallclock_table(
     zb_combine_avg: float,
     pta_dispatch_avg: float,
     pta_combine_avg: float,
+    zb_roundtrip_avg: float,
+    pta_roundtrip_avg: float,
     num_warmups: int,
     num_tests: int,
 ) -> None:
@@ -376,26 +451,34 @@ def print_wallclock_table(
 
     zb_d, zb_c = zb_dispatch_avg * 1e3, zb_combine_avg * 1e3
     pta_d, pta_c = pta_dispatch_avg * 1e3, pta_combine_avg * 1e3
+    zb_rt, pta_rt = zb_roundtrip_avg * 1e3, pta_roundtrip_avg * 1e3
     row = "  {:<28s} {:>14s} {:>14s} {:>12s}"
     sep = "  " + "-" * 72
+    total_iters = num_warmups + num_tests
     lines = [
         f"\n{'=' * 80}",
-        "  ZB vs PTA MC2 Wall-Clock Benchmark (dispatch/combine only, no GMM)",
+        "  ZB vs PTA MC2 Wall-Clock (NPU events, dispatch/combine only, no GMM)",
         f"{'=' * 80}",
         f"  num_tokens={num_tokens}, hidden={hidden}, num_topk={num_topk}, "
         f"num_experts={num_experts}, world_size={num_ranks}",
-        f"  warmup={num_warmups} (excluded), timed_iters={num_tests}",
+        f"  continuous iters={total_iters} (warmup={num_warmups}, timed={num_tests})",
+        "  per-stage: dispatch timed with untimed combine; combine timed with untimed dispatch",
         sep,
         row.format("Stage", "ZB SHMEM (ms)", "PTA V2 (ms)", "ZB speedup"),
         sep,
         row.format("Dispatch", f"{zb_d:.4f}", f"{pta_d:.4f}", _speedup(pta_d, zb_d)),
         row.format("Combine", f"{zb_c:.4f}", f"{pta_c:.4f}", _speedup(pta_c, zb_c)),
-        sep,
         row.format(
-            "Total",
+            "Sum (dispatch+combine)",
             f"{zb_d + zb_c:.4f}",
             f"{pta_d + pta_c:.4f}",
             _speedup(pta_d + pta_c, zb_d + zb_c),
+        ),
+        row.format(
+            "Round-trip (1 session)",
+            f"{zb_rt:.4f}",
+            f"{pta_rt:.4f}",
+            _speedup(pta_rt, zb_rt),
         ),
         f"{'=' * 80}\n",
     ]
@@ -419,7 +502,8 @@ def print_kernel_table(
         f"\n{'=' * 80}",
         f"  Kineto Kernel Timing — {label}",
         f"{'=' * 80}",
-        f"  warmup={num_warmups} (excluded), timed_iters={num_tests}",
+        f"  continuous iters={num_warmups + num_tests} "
+        f"(warmup={num_warmups}, timed={num_tests}; kernel dur, last N events)",
         f"  {kernel_names[0]}: {dispatch_t * 1e3:.4f} ms",
         f"  {kernel_names[1]}: {combine_t * 1e3:.4f} ms",
         f"  Total: {(dispatch_t + combine_t) * 1e3:.4f} ms",
@@ -456,7 +540,8 @@ def print_pta_baseline_wallclock_table(
         f"{'=' * 80}",
         f"  num_tokens={num_tokens}, hidden={hidden}, num_topk={num_topk}, "
         f"num_experts={num_experts}, world_size={num_ranks}",
-        f"  warmup={num_warmups} (excluded), timed_iters={num_tests}",
+        f"  continuous iters={num_warmups + num_tests} "
+        f"(warmup={num_warmups}, timed={num_tests}; NPU events)",
         sep,
         row.format("Stage", "PTA V2 (ms)"),
         sep,
@@ -497,7 +582,8 @@ def print_fused_mc2_wallclock_table(
         f"  kernel={kernel_label}",
         f"  num_tokens={num_tokens}, hidden={hidden}, moe_intermediate={moe_intermediate}, "
         f"num_topk={num_topk}, num_experts={num_experts}, world_size={num_ranks}",
-        f"  warmup={num_warmups} (excluded), timed_iters={num_tests}",
+        f"  continuous iters={num_warmups + num_tests} "
+        f"(warmup={num_warmups}, timed={num_tests}; NPU events)",
         sep,
         row.format("Fused op (dispatch+GMM+combine)", f"{fused_ms:.4f} ms"),
         f"{'=' * 80}\n",
@@ -521,7 +607,8 @@ def print_single_kernel_table(
         f"\n{'=' * 80}",
         f"  Kineto Kernel Timing — {label}",
         f"{'=' * 80}",
-        f"  warmup={num_warmups} (excluded), timed_iters={num_tests}",
+        f"  continuous iters={num_warmups + num_tests} "
+        f"(warmup={num_warmups}, timed={num_tests}; kernel dur, last N events)",
         f"  {kernel_name}: {duration_t * 1e3:.4f} ms",
     ]
     if trace_path is not None:

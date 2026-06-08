@@ -66,6 +66,8 @@ from zb_moe_prof_utils import (
     V2_MOE_KERNELS,
     bench,
     bench_kineto,
+    bench_moe_combine,
+    bench_moe_dispatch,
     msprof_kernel_summary,
     print_kernel_table,
     print_msprof_trace_info,
@@ -252,12 +254,18 @@ def _run_correctness(ctx: PtaMoeOpContext) -> None:
 def _run_bench(ctx: PtaMoeOpContext) -> None:
     num_warmups, num_tests = mc2_bench_iters()
 
-    ctx.run_dispatch()
-    torch.npu.synchronize()
-    dist.barrier()
-
-    dispatch_stats = bench(partial(ctx.run_dispatch), num_warmups, num_tests)
-    combine_stats = bench(partial(ctx.run_combine), num_warmups, num_tests)
+    dispatch_stats = bench_moe_dispatch(
+        ctx.run_dispatch,
+        ctx.run_combine,
+        num_warmups,
+        num_tests,
+    )
+    combine_stats = bench_moe_combine(
+        ctx.run_dispatch,
+        ctx.run_combine,
+        num_warmups,
+        num_tests,
+    )
 
     print_pta_baseline_wallclock_table(
         rank=ctx.rank,
@@ -281,7 +289,7 @@ def _run_bench(ctx: PtaMoeOpContext) -> None:
     )
     print_kernel_table(
         rank=ctx.rank,
-        label="PTA MC2 V2 kernels (baseline)",
+        label="PTA MC2 V2 kernels (baseline, round-trip session)",
         kernel_names=V2_MOE_KERNELS,
         dispatch_t=kernel_stats[0],
         combine_t=kernel_stats[1],

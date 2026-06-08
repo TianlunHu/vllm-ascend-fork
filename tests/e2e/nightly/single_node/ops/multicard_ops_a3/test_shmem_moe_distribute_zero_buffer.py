@@ -93,6 +93,8 @@ from zb_moe_prof_utils import (
     V2_MOE_KERNELS,
     bench,
     bench_kineto,
+    bench_moe_combine,
+    bench_moe_dispatch,
     msprof_kernel_summary,
     print_kernel_table,
     print_msprof_trace_info,
@@ -441,16 +443,40 @@ def _run_correctness(ctx: ZbMoeOpContext) -> None:
 def _run_bench(ctx: ZbMoeOpContext) -> None:
     num_warmups, num_tests = mc2_bench_iters()
 
-    # Seed combine metadata once (mirrors deepep_standalone combine-only bench).
-    ctx.run_pta_dispatch()
-    ctx.run_zb_dispatch()
-    torch.npu.synchronize()
-    dist.barrier()
-
-    zb_dispatch = bench(partial(ctx.run_zb_dispatch), num_warmups, num_tests)
-    zb_combine = bench(partial(ctx.run_zb_combine), num_warmups, num_tests)
-    pta_dispatch = bench(partial(ctx.run_pta_dispatch), num_warmups, num_tests)
-    pta_combine = bench(partial(ctx.run_pta_combine), num_warmups, num_tests)
+    zb_dispatch = bench_moe_dispatch(
+        ctx.run_zb_dispatch,
+        ctx.run_zb_combine,
+        num_warmups,
+        num_tests,
+    )
+    zb_combine = bench_moe_combine(
+        ctx.run_zb_dispatch,
+        ctx.run_zb_combine,
+        num_warmups,
+        num_tests,
+    )
+    pta_dispatch = bench_moe_dispatch(
+        ctx.run_pta_dispatch,
+        ctx.run_pta_combine,
+        num_warmups,
+        num_tests,
+    )
+    pta_combine = bench_moe_combine(
+        ctx.run_pta_dispatch,
+        ctx.run_pta_combine,
+        num_warmups,
+        num_tests,
+    )
+    zb_roundtrip = bench(
+        partial(ctx.run_zb_dispatch_combine),
+        num_warmups,
+        num_tests,
+    )
+    pta_roundtrip = bench(
+        partial(ctx.run_pta_dispatch_combine),
+        num_warmups,
+        num_tests,
+    )
 
     print_wallclock_table(
         rank=ctx.rank,
@@ -463,6 +489,8 @@ def _run_bench(ctx: ZbMoeOpContext) -> None:
         zb_combine_avg=zb_combine[0],
         pta_dispatch_avg=pta_dispatch[0],
         pta_combine_avg=pta_combine[0],
+        zb_roundtrip_avg=zb_roundtrip[0],
+        pta_roundtrip_avg=pta_roundtrip[0],
         num_warmups=num_warmups,
         num_tests=num_tests,
     )
@@ -483,7 +511,7 @@ def _run_bench(ctx: ZbMoeOpContext) -> None:
     )
     print_kernel_table(
         rank=ctx.rank,
-        label="ZB SHMEM kernels",
+        label="ZB SHMEM kernels (same round-trip session as wall-clock)",
         kernel_names=SHMEM_MOE_KERNELS,
         dispatch_t=zb_kernels[0],
         combine_t=zb_kernels[1],
@@ -492,13 +520,25 @@ def _run_bench(ctx: ZbMoeOpContext) -> None:
     )
     print_kernel_table(
         rank=ctx.rank,
-        label="PTA MC2 V2 kernels",
+        label="PTA MC2 V2 kernels (same round-trip session as wall-clock)",
         kernel_names=V2_MOE_KERNELS,
         dispatch_t=pta_kernels[0],
         combine_t=pta_kernels[1],
         num_warmups=num_warmups,
         num_tests=num_tests,
     )
+    if ctx.rank == 0:
+        zb_kineto_total = (zb_kernels[0] + zb_kernels[1]) * 1e3
+        pta_kineto_total = (pta_kernels[0] + pta_kernels[1]) * 1e3
+        zb_rt_ms = zb_roundtrip[0] * 1e3
+        pta_rt_ms = pta_roundtrip[0] * 1e3
+        print(
+            f"\n  Cross-check (rank 0): round-trip wall-clock ZB={zb_rt_ms:.4f} ms "
+            f"PTA={pta_rt_ms:.4f} ms | kineto kernel-sum ZB={zb_kineto_total:.4f} ms "
+            f"PTA={pta_kineto_total:.4f} ms\n"
+            "  (wall-clock includes sync/Python; kineto is device kernel dur only)\n",
+            flush=True,
+        )
     dist.barrier()
 
 
