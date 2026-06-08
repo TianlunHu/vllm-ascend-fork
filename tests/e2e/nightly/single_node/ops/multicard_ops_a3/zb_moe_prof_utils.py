@@ -25,6 +25,10 @@ V2_MOE_KERNELS = (
     "MoeDistributeCombineV2",
 )
 
+# Kernel names as they appear in Kineto chrome traces (lowercase op entry symbols).
+FUSED_MC2_FFNC_KERNEL = ("dispatch_ffn_combine",)
+FUSED_MC2_GMMCD_KERNEL = ("dispatch_gmm_combine_decode",)
+
 
 class _EmptySuppress:
     def __enter__(self):
@@ -226,6 +230,105 @@ def print_kernel_table(
         f"  {kernel_names[0]}: {dispatch_t * 1e3:.4f} ms",
         f"  {kernel_names[1]}: {combine_t * 1e3:.4f} ms",
         f"  Total: {(dispatch_t + combine_t) * 1e3:.4f} ms",
+    ]
+    if trace_path is not None:
+        lines.append(f"  trace -> {trace_path}")
+    lines.append(f"{'=' * 80}\n")
+    print("\n".join(lines), flush=True)
+
+
+def print_pta_baseline_wallclock_table(
+    *,
+    rank: int,
+    num_tokens: int,
+    hidden: int,
+    num_topk: int,
+    num_experts: int,
+    num_ranks: int,
+    dispatch_avg: float,
+    combine_avg: float,
+    num_warmups: int,
+    num_tests: int,
+) -> None:
+    if rank != 0:
+        return
+
+    dispatch_ms = dispatch_avg * 1e3
+    combine_ms = combine_avg * 1e3
+    row = "  {:<28s} {:>16s}"
+    sep = "  " + "-" * 48
+    lines = [
+        f"\n{'=' * 80}",
+        "  PTA MC2 V2 Baseline Wall-Clock (dispatch/combine only, no GMM)",
+        f"{'=' * 80}",
+        f"  num_tokens={num_tokens}, hidden={hidden}, num_topk={num_topk}, "
+        f"num_experts={num_experts}, world_size={num_ranks}",
+        f"  warmup={num_warmups}, iters={num_tests}",
+        sep,
+        row.format("Stage", "PTA V2 (ms)"),
+        sep,
+        row.format("MoeDistributeDispatchV2", f"{dispatch_ms:.4f}"),
+        row.format("MoeDistributeCombineV2", f"{combine_ms:.4f}"),
+        sep,
+        row.format("Total", f"{dispatch_ms + combine_ms:.4f}"),
+        f"{'=' * 80}\n",
+    ]
+    print("\n".join(lines), flush=True)
+
+
+def print_fused_mc2_wallclock_table(
+    *,
+    rank: int,
+    variant: int,
+    kernel_label: str,
+    num_tokens: int,
+    hidden: int,
+    num_topk: int,
+    num_experts: int,
+    num_ranks: int,
+    moe_intermediate: int,
+    fused_avg: float,
+    num_warmups: int,
+    num_tests: int,
+) -> None:
+    if rank != 0:
+        return
+
+    fused_ms = fused_avg * 1e3
+    row = "  {:<36s} {:>16s}"
+    sep = "  " + "-" * 56
+    lines = [
+        f"\n{'=' * 80}",
+        f"  Fused MC2 Baseline (VLLM_ASCEND_ENABLE_FUSED_MC2={variant})",
+        f"{'=' * 80}",
+        f"  kernel={kernel_label}",
+        f"  num_tokens={num_tokens}, hidden={hidden}, moe_intermediate={moe_intermediate}, "
+        f"num_topk={num_topk}, num_experts={num_experts}, world_size={num_ranks}",
+        f"  warmup={num_warmups}, iters={num_tests}",
+        sep,
+        row.format("Fused op (dispatch+GMM+combine)", f"{fused_ms:.4f} ms"),
+        f"{'=' * 80}\n",
+    ]
+    print("\n".join(lines), flush=True)
+
+
+def print_single_kernel_table(
+    *,
+    rank: int,
+    label: str,
+    kernel_name: str,
+    duration_t: float,
+    num_tests: int,
+    trace_path: Optional[str] = None,
+) -> None:
+    if rank != 0:
+        return
+    lines = [
+        f"\n{'=' * 80}",
+        f"  Kineto Kernel Timing — {label}",
+        f"{'=' * 80}",
+        f"  profiler_iters={num_tests}",
+        f"  {kernel_name}: {duration_t * 1e3:.4f} ms",
     ]
     if trace_path is not None:
         lines.append(f"  trace -> {trace_path}")
