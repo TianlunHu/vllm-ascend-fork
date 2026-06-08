@@ -33,6 +33,43 @@ def mc2_int_env(name: str, zb_fallback: str, default: str) -> int:
     return int(default)
 
 
+def mc2_world_size() -> int:
+    return mc2_int_env(
+        "VLLM_ASCEND_MOE_MC2_TEST_WORLD_SIZE",
+        "VLLM_ASCEND_ZB_TEST_WORLD_SIZE",
+        "8",
+    )
+
+
+def mc2_bench_iters() -> tuple[int, int]:
+    warmups = mc2_int_env(
+        "VLLM_ASCEND_MOE_MC2_TEST_NUM_WARMUPS",
+        "VLLM_ASCEND_ZB_TEST_NUM_WARMUPS",
+        "10",
+    )
+    tests = mc2_int_env(
+        "VLLM_ASCEND_MOE_MC2_TEST_NUM_TESTS",
+        "VLLM_ASCEND_ZB_TEST_NUM_TESTS",
+        "100",
+    )
+    return warmups, tests
+
+
+def mc2_profile_iters() -> int:
+    return mc2_int_env(
+        "VLLM_ASCEND_MOE_MC2_TEST_NUM_PROFILE_TESTS",
+        "VLLM_ASCEND_ZB_TEST_NUM_PROFILE_TESTS",
+        "30",
+    )
+
+
+def mc2_trace_dir(default: str) -> str:
+    return os.environ.get(
+        "VLLM_ASCEND_MOE_MC2_TEST_TRACE_DIR",
+        os.environ.get("VLLM_ASCEND_ZB_TEST_TRACE_DIR", default),
+    )
+
+
 def mc2_shape_config(world_size: int) -> dict:
     """Read tensor shapes; falls back to VLLM_ASCEND_ZB_TEST_* for cross-test parity."""
     num_tokens = mc2_int_env(

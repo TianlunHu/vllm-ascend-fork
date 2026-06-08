@@ -46,7 +46,10 @@ Examples:
 Requires:
   - package built with ``VLLM_ASCEND_ENABLE_ZB_OPS=1``
   - ``VLLM_ASCEND_ZB_SHMEM_URI`` reachable across EP ranks
-  - A3 with at least ``VLLM_ASCEND_ZB_TEST_WORLD_SIZE`` NPUs (default 8)
+  - A3 with at least ``VLLM_ASCEND_MOE_MC2_TEST_WORLD_SIZE`` NPUs (default 8)
+
+Shape/bench env (shared with PTA/Fused baseline tests):
+  ``VLLM_ASCEND_MOE_MC2_TEST_*`` (preferred), legacy ``VLLM_ASCEND_ZB_TEST_*`` fallback.
 """
 
 from __future__ import annotations
@@ -76,6 +79,15 @@ from vllm_ascend.ops.fused_moe.shmem_runtime import (
 )
 from vllm_ascend.utils import enable_custom_op
 
+from moe_mc2_e2e_common import (
+    mc2_bench_iters,
+    mc2_hccl_port,
+    mc2_int_env,
+    mc2_profile_iters,
+    mc2_shape_config,
+    mc2_trace_dir,
+    mc2_world_size,
+)
 from zb_moe_prof_utils import (
     SHMEM_MOE_KERNELS,
     V2_MOE_KERNELS,
@@ -98,7 +110,7 @@ def _shmem_server_ipport() -> str:
 
 
 def _hccl_master_port() -> int:
-    return int(os.environ.get("VLLM_ASCEND_ZB_TEST_HCCL_PORT", "29500"))
+    return mc2_hccl_port()
 
 
 def _get_group_ep(rank: int) -> str:
@@ -292,15 +304,13 @@ class ZbMoeOpContext:
 
 
 def _build_context(rank: int, world_size: int) -> ZbMoeOpContext:
-    num_tokens = int(os.environ.get("VLLM_ASCEND_ZB_TEST_NUM_TOKENS", "32"))
-    hidden = int(os.environ.get("VLLM_ASCEND_ZB_TEST_HIDDEN", "2048"))
-    num_topk = int(os.environ.get("VLLM_ASCEND_ZB_TEST_NUM_TOPK", "8"))
-    num_experts = int(
-        os.environ.get("VLLM_ASCEND_ZB_TEST_NUM_EXPERTS",
-                        str(max(world_size * 2, 16))))
-    assert num_experts % world_size == 0, "num_experts must be divisible by world_size"
-    num_local_experts = num_experts // world_size
-    global_bs = num_tokens * world_size
+    cfg = mc2_shape_config(world_size)
+    num_tokens = cfg["num_tokens"]
+    hidden = cfg["hidden"]
+    num_topk = cfg["num_topk"]
+    num_experts = cfg["num_experts"]
+    num_local_experts = cfg["num_local_experts"]
+    global_bs = cfg["global_bs"]
     num_max_tokens = global_bs * num_local_experts
     device = f"npu:{rank}"
 
@@ -426,8 +436,7 @@ def _run_correctness(ctx: ZbMoeOpContext) -> None:
 
 
 def _run_bench(ctx: ZbMoeOpContext) -> None:
-    num_warmups = int(os.environ.get("VLLM_ASCEND_ZB_TEST_NUM_WARMUPS", "10"))
-    num_tests = int(os.environ.get("VLLM_ASCEND_ZB_TEST_NUM_TESTS", "100"))
+    num_warmups, num_tests = mc2_bench_iters()
 
     # Seed combine metadata once (mirrors deepep_standalone combine-only bench).
     ctx.run_pta_dispatch()
@@ -488,9 +497,9 @@ def _run_bench(ctx: ZbMoeOpContext) -> None:
 
 
 def _run_profile(ctx: ZbMoeOpContext) -> None:
-    num_warmups = int(os.environ.get("VLLM_ASCEND_ZB_TEST_NUM_WARMUPS", "10"))
-    num_tests = int(os.environ.get("VLLM_ASCEND_ZB_TEST_NUM_PROFILE_TESTS", "30"))
-    trace_dir = os.environ.get("VLLM_ASCEND_ZB_TEST_TRACE_DIR", "./traces/zb_moe")
+    num_warmups, _ = mc2_bench_iters()
+    num_tests = mc2_profile_iters()
+    trace_dir = mc2_trace_dir("./traces/zb_moe")
     os.makedirs(trace_dir, exist_ok=True)
 
     for fn in (ctx.run_zb_dispatch_combine, ctx.run_pta_dispatch_combine):
@@ -552,8 +561,7 @@ def _launch_multiprocess(world_size: int | None = None) -> None:
             "shmem_moe_distribute_dispatch_zero_buffer not registered; rebuild "
             "vllm_ascend_C with VLLM_ASCEND_ENABLE_ZB_OPS=1")
 
-    world_size = world_size or int(
-        os.environ.get("VLLM_ASCEND_ZB_TEST_WORLD_SIZE", "8"))
+    world_size = world_size or mc2_world_size()
     port = _hccl_master_port() + random.randint(0, 10000)
     mp.set_start_method("fork", force=True)
 
@@ -610,22 +618,34 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--world-size",
         type=int,
-        default=int(os.environ.get("VLLM_ASCEND_ZB_TEST_WORLD_SIZE", "8")),
+        default=mc2_world_size(),
     )
     parser.add_argument(
         "--num-tokens",
         type=int,
-        default=int(os.environ.get("VLLM_ASCEND_ZB_TEST_NUM_TOKENS", "32")),
+        default=mc2_int_env(
+            "VLLM_ASCEND_MOE_MC2_TEST_NUM_TOKENS",
+            "VLLM_ASCEND_ZB_TEST_NUM_TOKENS",
+            "32",
+        ),
     )
     parser.add_argument(
         "--hidden",
         type=int,
-        default=int(os.environ.get("VLLM_ASCEND_ZB_TEST_HIDDEN", "2048")),
+        default=mc2_int_env(
+            "VLLM_ASCEND_MOE_MC2_TEST_HIDDEN",
+            "VLLM_ASCEND_ZB_TEST_HIDDEN",
+            "2048",
+        ),
     )
     parser.add_argument(
         "--num-topk",
         type=int,
-        default=int(os.environ.get("VLLM_ASCEND_ZB_TEST_NUM_TOPK", "8")),
+        default=mc2_int_env(
+            "VLLM_ASCEND_MOE_MC2_TEST_NUM_TOPK",
+            "VLLM_ASCEND_ZB_TEST_NUM_TOPK",
+            "8",
+        ),
     )
     parser.add_argument(
         "--num-experts",
@@ -636,22 +656,22 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--num-warmups",
         type=int,
-        default=int(os.environ.get("VLLM_ASCEND_ZB_TEST_NUM_WARMUPS", "10")),
+        default=mc2_bench_iters()[0],
     )
     parser.add_argument(
         "--num-tests",
         type=int,
-        default=int(os.environ.get("VLLM_ASCEND_ZB_TEST_NUM_TESTS", "100")),
+        default=mc2_bench_iters()[1],
     )
     parser.add_argument(
         "--num-profile-tests",
         type=int,
-        default=int(os.environ.get("VLLM_ASCEND_ZB_TEST_NUM_PROFILE_TESTS", "30")),
+        default=mc2_profile_iters(),
     )
     parser.add_argument(
         "--trace-dir",
         type=str,
-        default=os.environ.get("VLLM_ASCEND_ZB_TEST_TRACE_DIR", "./traces/zb_moe"),
+        default=mc2_trace_dir("./traces/zb_moe"),
     )
     return parser.parse_args()
 
@@ -659,6 +679,18 @@ def _parse_args() -> argparse.Namespace:
 if __name__ == "__main__":
     args = _parse_args()
     os.environ["VLLM_ASCEND_ZB_TEST_MODE"] = args.mode
+    os.environ["VLLM_ASCEND_MOE_MC2_TEST_WORLD_SIZE"] = str(args.world_size)
+    os.environ["VLLM_ASCEND_MOE_MC2_TEST_NUM_TOKENS"] = str(args.num_tokens)
+    os.environ["VLLM_ASCEND_MOE_MC2_TEST_HIDDEN"] = str(args.hidden)
+    os.environ["VLLM_ASCEND_MOE_MC2_TEST_NUM_TOPK"] = str(args.num_topk)
+    if args.num_experts is not None:
+        os.environ["VLLM_ASCEND_MOE_MC2_TEST_NUM_EXPERTS"] = str(args.num_experts)
+    os.environ["VLLM_ASCEND_MOE_MC2_TEST_NUM_WARMUPS"] = str(args.num_warmups)
+    os.environ["VLLM_ASCEND_MOE_MC2_TEST_NUM_TESTS"] = str(args.num_tests)
+    os.environ["VLLM_ASCEND_MOE_MC2_TEST_NUM_PROFILE_TESTS"] = str(
+        args.num_profile_tests)
+    os.environ["VLLM_ASCEND_MOE_MC2_TEST_TRACE_DIR"] = args.trace_dir
+    # Mirror resolved values for legacy ZB_TEST_* readers.
     os.environ["VLLM_ASCEND_ZB_TEST_WORLD_SIZE"] = str(args.world_size)
     os.environ["VLLM_ASCEND_ZB_TEST_NUM_TOKENS"] = str(args.num_tokens)
     os.environ["VLLM_ASCEND_ZB_TEST_HIDDEN"] = str(args.hidden)
@@ -667,6 +699,7 @@ if __name__ == "__main__":
         os.environ["VLLM_ASCEND_ZB_TEST_NUM_EXPERTS"] = str(args.num_experts)
     os.environ["VLLM_ASCEND_ZB_TEST_NUM_WARMUPS"] = str(args.num_warmups)
     os.environ["VLLM_ASCEND_ZB_TEST_NUM_TESTS"] = str(args.num_tests)
-    os.environ["VLLM_ASCEND_ZB_TEST_NUM_PROFILE_TESTS"] = str(args.num_profile_tests)
+    os.environ["VLLM_ASCEND_ZB_TEST_NUM_PROFILE_TESTS"] = str(
+        args.num_profile_tests)
     os.environ["VLLM_ASCEND_ZB_TEST_TRACE_DIR"] = args.trace_dir
     _launch_multiprocess(args.world_size)
