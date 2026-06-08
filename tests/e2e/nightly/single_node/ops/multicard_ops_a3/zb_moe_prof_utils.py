@@ -72,6 +72,15 @@ def _load_trace_events(trace_path: Path) -> list:
     return profile_data
 
 
+def _read_event_times(
+    starts: list[torch.npu.Event],
+    ends: list[torch.npu.Event],
+) -> list[float]:
+    """Read NPU event pairs after a single device sync."""
+    torch.npu.synchronize()
+    return [start.elapsed_time(end) / 1e3 for start, end in zip(starts, ends)]
+
+
 def bench(
     fn: Callable[[], None],
     num_warmups: int = 50,
@@ -82,12 +91,14 @@ def bench(
 
     Runs ``num_warmups + num_tests`` iterations back-to-back in one session.
     Only the last ``num_tests`` iterations are timed (e.g. 50 + 100 = 150 total).
+    No per-iteration ``torch.npu.synchronize()`` — events are batch-read once
+    at the end.
     """
-    device = torch.device("npu")
     torch.npu.synchronize()
 
     total_iters = num_warmups + num_tests
-    times: list[float] = []
+    starts: list[torch.npu.Event] = []
+    ends: list[torch.npu.Event] = []
     for i in range(total_iters):
         record = i >= num_warmups
         if record:
@@ -99,9 +110,10 @@ def bench(
             end.record()
             if post_fn is not None:
                 post_fn()
-            torch.npu.synchronize()
-            times.append(start.elapsed_time(end) / 1e3)
+            starts.append(start)
+            ends.append(end)
 
+    times = _read_event_times(starts, ends)
     samples = np.array(times, dtype=np.float64)
     return float(np.average(samples)), float(np.min(samples)), float(np.max(samples))
 
@@ -119,7 +131,8 @@ def bench_moe_dispatch(
     """
     torch.npu.synchronize()
     total_iters = num_warmups + num_tests
-    times: list[float] = []
+    starts: list[torch.npu.Event] = []
+    ends: list[torch.npu.Event] = []
     for i in range(total_iters):
         record = i >= num_warmups
         if record:
@@ -129,11 +142,11 @@ def bench_moe_dispatch(
         if record:
             end = torch.npu.Event(enable_timing=True)
             end.record()
+            starts.append(start)
+            ends.append(end)
         run_combine()
-        if record:
-            torch.npu.synchronize()
-            times.append(start.elapsed_time(end) / 1e3)
 
+    times = _read_event_times(starts, ends)
     samples = np.array(times, dtype=np.float64)
     return float(np.average(samples)), float(np.min(samples)), float(np.max(samples))
 
@@ -151,7 +164,8 @@ def bench_moe_combine(
     """
     torch.npu.synchronize()
     total_iters = num_warmups + num_tests
-    times: list[float] = []
+    starts: list[torch.npu.Event] = []
+    ends: list[torch.npu.Event] = []
     for i in range(total_iters):
         run_dispatch()
         record = i >= num_warmups
@@ -162,9 +176,10 @@ def bench_moe_combine(
         if record:
             end = torch.npu.Event(enable_timing=True)
             end.record()
-            torch.npu.synchronize()
-            times.append(start.elapsed_time(end) / 1e3)
+            starts.append(start)
+            ends.append(end)
 
+    times = _read_event_times(starts, ends)
     samples = np.array(times, dtype=np.float64)
     return float(np.average(samples)), float(np.min(samples)), float(np.max(samples))
 
@@ -463,6 +478,7 @@ def print_wallclock_table(
         f"num_experts={num_experts}, world_size={num_ranks}",
         f"  continuous iters={total_iters} (warmup={num_warmups}, timed={num_tests})",
         "  per-stage: dispatch timed with untimed combine; combine timed with untimed dispatch",
+        "  timing: NPU events, one device sync after the full loop (no per-iter sync)",
         sep,
         row.format("Stage", "ZB SHMEM (ms)", "PTA V2 (ms)", "ZB speedup"),
         sep,
