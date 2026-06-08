@@ -1,9 +1,7 @@
 #!/usr/bin/env bash
 # PTA MC2 baseline: npu_moe_distribute_dispatch_v2 / combine_v2 e2e (no SHMEM).
 #
-# Profile traces (mode=profile) default directory:
-#   <repo-root>/traces/pta_mc2_baseline_<timestamp>/
-# Files: rank<N>_pta_v2.json
+# Profile traces (mode=profile): full msprof under pta_v2/rank<N>_pta_v2.*_ascend_pt/
 #
 # For fair comparison with ZB test, use the same shape parameters on both scripts
 # (MOE_MC2_TEST_* or ZB_TEST_NUM_TOKENS / HIDDEN are both read).
@@ -84,12 +82,12 @@ python "${TEST_PY}" \
 
 if [[ "${MODE}" == "profile" ]]; then
   echo ""
-  echo "=== Profile traces (PTA baseline) ==="
-  echo "  directory: ${TRACE_DIR}"
-  ls -lh "${TRACE_DIR}"/*.json 2>/dev/null || echo "  (no .json files found)"
+  echo "=== Profile traces (PTA baseline, msprof) ==="
+  echo "  directory: ${TRACE_DIR}/pta_v2/"
+  find "${TRACE_DIR}" -name '*_ascend_pt' -type d 2>/dev/null | head -20 || true
   echo ""
   echo "  Compare with ZB: run run_shmem_moe_zb_test.sh profile with same shapes."
-  echo "  Open traces: chrome://tracing or https://ui.perfetto.dev/"
+  echo "  Inspect ASCEND_PROFILER_OUTPUT/trace_view.json in MindStudio Insight."
 elif [[ "${MODE}" == "bench" ]]; then
   echo ""
   echo "=== bench mode (PTA baseline only) ==="

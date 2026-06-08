@@ -70,8 +70,11 @@ from zb_moe_prof_utils import (
     FUSED_MC2_GMMCD_KERNEL,
     bench,
     bench_kineto,
+    msprof_kernel_summary,
     print_fused_mc2_wallclock_table,
+    print_msprof_trace_info,
     print_single_kernel_table,
+    profile_msprof,
 )
 
 enable_custom_op()
@@ -365,29 +368,31 @@ def _run_profile(ctx: FusedMc2OpContext) -> None:
     dist.barrier()
 
     suffix = "ffn_combine" if ctx.variant == 1 else "gmm_combine_decode"
-    trace_path = os.path.join(trace_dir, f"rank{ctx.rank}_fused_mc2_{suffix}.json")
-    kernel_t = bench_kineto(
+    trace_root = os.path.join(trace_dir, f"fused_mc2_{suffix}")
+    worker_name = f"rank{ctx.rank}_fused_mc2_{suffix}"
+    profile_msprof(
         partial(ctx.run_fused),
-        kernel_names=ctx.kernel_name,
+        trace_root=trace_root,
+        worker_name=worker_name,
         num_tests=num_tests,
-        trace_path=trace_path,
-        suppress_kineto_output=(ctx.rank != 0),
+        suppress_output=(ctx.rank != 0),
     )
     dist.barrier()
 
-    print_single_kernel_table(
+    summary = msprof_kernel_summary(trace_root, ctx.kernel_name)
+    kernel_duration = summary[0] if summary else None
+    print_msprof_trace_info(
         rank=ctx.rank,
         label=f"Fused MC2 variant={ctx.variant}",
-        kernel_name=ctx.kernel_name,
-        duration_t=float(kernel_t),
+        trace_root=trace_root,
         num_tests=num_tests,
-        trace_path=trace_path,
+        kernel_names=(ctx.kernel_name,),
+        kernel_durations=(kernel_duration,) if kernel_duration is not None else None,
     )
     if ctx.rank == 0:
         print(
-            f"\n  Chrome traces saved under: {trace_dir}\n"
-            f"  Files: rank<N>_fused_mc2_{suffix}.json\n"
-            "  Open with chrome://tracing or Perfetto UI.\n",
+            f"\n  Full msprof traces saved under: {trace_dir}/fused_mc2_{suffix}/\n"
+            "  Inspect ASCEND_PROFILER_OUTPUT/trace_view.json in MindStudio Insight.\n",
             flush=True,
         )
 

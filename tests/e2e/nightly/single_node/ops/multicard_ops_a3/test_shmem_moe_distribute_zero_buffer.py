@@ -29,7 +29,7 @@ Optional PTA baseline (for perf comparison):
 Modes (``VLLM_ASCEND_ZB_TEST_MODE``):
   - ``correctness`` (default): single round-trip + local verify
   - ``bench``: NPU-event wall clock for ZB vs PTA dispatch/combine
-  - ``profile``: Kineto kernel-only timing + chrome trace export
+  - ``profile``: full msprof trace (CPU+NPU) + optional dispatch/combine summary
 
 Examples:
   # correctness (pytest default)
@@ -93,8 +93,11 @@ from zb_moe_prof_utils import (
     V2_MOE_KERNELS,
     bench,
     bench_kineto,
+    msprof_kernel_summary,
     print_kernel_table,
+    print_msprof_trace_info,
     print_wallclock_table,
+    profile_msprof,
 )
 
 enable_custom_op()
@@ -508,48 +511,52 @@ def _run_profile(ctx: ZbMoeOpContext) -> None:
     torch.npu.synchronize()
     dist.barrier()
 
-    zb_trace = os.path.join(trace_dir, f"rank{ctx.rank}_zb_shmem.json")
-    pta_trace = os.path.join(trace_dir, f"rank{ctx.rank}_pta_v2.json")
+    zb_root = os.path.join(trace_dir, "zb_shmem")
+    pta_root = os.path.join(trace_dir, "pta_v2")
+    zb_worker = f"rank{ctx.rank}_zb_shmem"
+    pta_worker = f"rank{ctx.rank}_pta_v2"
 
-    zb_kernels = bench_kineto(
+    profile_msprof(
         partial(ctx.run_zb_dispatch_combine),
-        kernel_names=SHMEM_MOE_KERNELS,
+        trace_root=zb_root,
+        worker_name=zb_worker,
         num_tests=num_tests,
-        trace_path=zb_trace,
-        suppress_kineto_output=(ctx.rank != 0),
+        suppress_output=(ctx.rank != 0),
     )
     dist.barrier()
-    pta_kernels = bench_kineto(
+    profile_msprof(
         partial(ctx.run_pta_dispatch_combine),
-        kernel_names=V2_MOE_KERNELS,
+        trace_root=pta_root,
+        worker_name=pta_worker,
         num_tests=num_tests,
-        trace_path=pta_trace,
-        suppress_kineto_output=(ctx.rank != 0),
+        suppress_output=(ctx.rank != 0),
     )
     dist.barrier()
 
-    print_kernel_table(
+    zb_summary = msprof_kernel_summary(zb_root, SHMEM_MOE_KERNELS)
+    pta_summary = msprof_kernel_summary(pta_root, V2_MOE_KERNELS)
+
+    print_msprof_trace_info(
         rank=ctx.rank,
-        label="ZB SHMEM kernels",
+        label="ZB SHMEM",
+        trace_root=zb_root,
+        num_tests=num_tests,
         kernel_names=SHMEM_MOE_KERNELS,
-        dispatch_t=zb_kernels[0],
-        combine_t=zb_kernels[1],
-        num_tests=num_tests,
-        trace_path=zb_trace,
+        kernel_durations=zb_summary,
     )
-    print_kernel_table(
+    print_msprof_trace_info(
         rank=ctx.rank,
-        label="PTA MC2 V2 kernels",
-        kernel_names=V2_MOE_KERNELS,
-        dispatch_t=pta_kernels[0],
-        combine_t=pta_kernels[1],
+        label="PTA MC2 V2",
+        trace_root=pta_root,
         num_tests=num_tests,
-        trace_path=pta_trace,
+        kernel_names=V2_MOE_KERNELS,
+        kernel_durations=pta_summary,
     )
     if ctx.rank == 0:
         print(
-            f"\n  Chrome traces saved under: {trace_dir}\n"
-            "  Open with chrome://tracing or Perfetto UI.\n",
+            f"\n  Full msprof traces saved under: {trace_dir}\n"
+            "  Layout: zb_shmem/ and pta_v2/ per rank (*_ascend_pt bundles)\n"
+            "  Inspect ASCEND_PROFILER_OUTPUT/trace_view.json in MindStudio Insight.\n",
             flush=True,
         )
 
@@ -613,7 +620,7 @@ def _parse_args() -> argparse.Namespace:
         type=str,
         default=os.environ.get("VLLM_ASCEND_ZB_TEST_MODE", "correctness"),
         choices=["correctness", "bench", "profile"],
-        help="correctness | bench (wall clock + kineto summary) | profile (trace export)",
+        help="correctness | bench (wall clock + kineto summary) | profile (full msprof trace)",
     )
     parser.add_argument(
         "--world-size",

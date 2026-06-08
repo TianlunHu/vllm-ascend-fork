@@ -106,6 +106,177 @@ def bench(
     return float(np.average(samples)), float(np.min(samples)), float(np.max(samples))
 
 
+def _msprof_experimental_config():
+    """Match vLLM-Ascend serving torch profiler (full msprof export)."""
+    return torch_npu.profiler._ExperimentalConfig(
+        export_type=torch_npu.profiler.ExportType.Text,
+        profiler_level=torch_npu.profiler.ProfilerLevel.Level1,
+        msprof_tx=False,
+        aic_metrics=torch_npu.profiler.AiCMetrics.AiCoreNone,
+        l2_cache=False,
+        op_attr=False,
+        data_simplification=True,
+        record_op_args=False,
+        gc_detect_threshold=None,
+    )
+
+
+def profile_msprof(
+    fn: Callable[[], None],
+    trace_root: str,
+    worker_name: str,
+    num_tests: int = 30,
+    suppress_output: bool = False,
+    run_analyse: bool = True,
+) -> str:
+    """Capture a full Ascend/msprof trace (CPU + NPU) under ``trace_root``.
+
+    Returns the directory passed to ``tensorboard_trace_handler`` (``trace_root``).
+    When ``run_analyse`` is True, runs ``torch_npu.profiler.profiler.analyse`` on
+    each ``*_ascend_pt`` bundle so ``ASCEND_PROFILER_OUTPUT/`` (op_statistic.csv,
+    kernel_details.csv, trace_view.json, ...) is generated.
+    """
+    trace_root_path = Path(trace_root)
+    trace_root_path.mkdir(parents=True, exist_ok=True)
+
+    suppress = _SuppressStdoutStderr if suppress_output else _EmptySuppress
+    with suppress():
+        with torch_npu.profiler.profile(
+            activities=[
+                torch_npu.profiler.ProfilerActivity.CPU,
+                torch_npu.profiler.ProfilerActivity.NPU,
+            ],
+            with_stack=False,
+            profile_memory=False,
+            with_modules=False,
+            experimental_config=_msprof_experimental_config(),
+            on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(
+                str(trace_root_path),
+                worker_name=worker_name,
+            ),
+        ):
+            for _ in range(num_tests):
+                fn()
+            torch.npu.synchronize()
+
+    if run_analyse:
+        _analyse_msprof_bundles(trace_root_path)
+    return str(trace_root_path)
+
+
+def _analyse_msprof_bundles(trace_root: Path) -> list[Path]:
+    """Run ascend analyse on profiler bundles; return analysed ascend_pt dirs."""
+    try:
+        from torch_npu.profiler.profiler import analyse
+    except ImportError:
+        return []
+
+    analysed: list[Path] = []
+    bundles = sorted(trace_root.rglob("*_ascend_pt"))
+    if not bundles:
+        bundles = sorted(p for p in trace_root.rglob("*") if p.is_dir() and p.name.endswith("_ascend_pt"))
+    for bundle in bundles:
+        if not bundle.is_dir():
+            continue
+        out_dir = bundle / "ASCEND_PROFILER_OUTPUT"
+        if out_dir.is_dir():
+            analysed.append(bundle)
+            continue
+        with _EmptySuppress():
+            analyse(str(bundle))
+        analysed.append(bundle)
+    return analysed
+
+
+def msprof_kernel_summary(
+    trace_root: str,
+    kernel_names: Union[str, Tuple[str, ...]],
+) -> Optional[Tuple[float, ...]]:
+    """Return per-kernel average seconds from msprof op_statistic.csv (best effort)."""
+    names = (kernel_names,) if isinstance(kernel_names, str) else kernel_names
+    return _kernel_durations_from_msprof(Path(trace_root), names)
+
+
+def _kernel_durations_from_msprof(
+    trace_root: Path,
+    kernel_names: Tuple[str, ...],
+) -> Optional[Tuple[float, ...]]:
+    """Best-effort dispatch/combine averages from msprof ``op_statistic.csv``."""
+    import csv
+
+    for bundle in _analyse_msprof_bundles(trace_root):
+        csv_path = bundle / "ASCEND_PROFILER_OUTPUT" / "op_statistic.csv"
+        if not csv_path.is_file():
+            continue
+        with csv_path.open(newline="") as handle:
+            reader = csv.DictReader(handle)
+            rows = list(reader)
+        if not rows:
+            continue
+
+        header = {name.lower(): name for name in rows[0].keys()}
+        name_key = header.get("op_name") or header.get("name") or header.get("op type")
+        time_key = (
+            header.get("total_time(us)")
+            or header.get("total time(us)")
+            or header.get("total_time")
+            or header.get("duration(us)")
+        )
+        if name_key is None or time_key is None:
+            continue
+
+        durations: list[float] = []
+        for kernel_name in kernel_names:
+            matched = [
+                row for row in rows
+                if kernel_name.lower() in str(row.get(name_key, "")).lower()
+            ]
+            if not matched:
+                break
+            total_us = sum(float(row[time_key]) for row in matched)
+            durations.append(total_us / len(matched) / 1e6)
+        if len(durations) == len(kernel_names):
+            return tuple(durations)
+    return None
+
+
+def print_msprof_trace_info(
+    *,
+    rank: int,
+    label: str,
+    trace_root: str,
+    num_tests: int,
+    kernel_names: Optional[Tuple[str, ...]] = None,
+    kernel_durations: Optional[Tuple[float, ...]] = None,
+) -> None:
+    if rank != 0:
+        return
+
+    lines = [
+        f"\n{'=' * 80}",
+        f"  msprof Trace — {label}",
+        f"{'=' * 80}",
+        f"  profiler_iters={num_tests}",
+        f"  trace_root -> {trace_root}",
+        "  Bundles: <trace_root>/*_ascend_pt/",
+        "  After analyse: ASCEND_PROFILER_OUTPUT/{op_statistic,kernel_details,trace_view}.csv/json",
+        "  View trace_view.json in MindStudio Insight or chrome://tracing",
+    ]
+    if kernel_names is not None and kernel_durations is not None:
+        for name, duration in zip(kernel_names, kernel_durations):
+            lines.append(
+                f"  {name} (from op_statistic.csv): {duration * 1e3:.4f} ms",
+            )
+        if len(kernel_durations) > 1:
+            lines.append(f"  Total: {sum(kernel_durations) * 1e3:.4f} ms")
+    elif kernel_names is not None:
+        lines.append(
+            "  (dispatch/combine summary unavailable — inspect op_statistic.csv in trace bundle)",
+        )
+    lines.append(f"{'=' * 80}\n")
+    print("\n".join(lines), flush=True)
+
+
 def bench_kineto(
     fn: Callable[[], None],
     kernel_names: Union[str, Tuple[str, ...]],

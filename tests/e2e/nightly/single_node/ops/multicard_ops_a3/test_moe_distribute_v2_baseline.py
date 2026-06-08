@@ -24,7 +24,7 @@ Use the same shape env vars as the ZB test for apples-to-apples comparison:
 Modes (``VLLM_ASCEND_PTA_MC2_TEST_MODE``):
   - ``correctness`` (default): dispatch -> combine round-trip verify
   - ``bench``: NPU-event wall clock + Kineto kernel summary
-  - ``profile``: export chrome trace (rank<N>_pta_v2.json)
+  - ``profile``: full msprof trace (CPU+NPU)
 
 Examples:
   ./run_moe_distribute_v2_baseline_test.sh
@@ -64,8 +64,11 @@ from zb_moe_prof_utils import (
     V2_MOE_KERNELS,
     bench,
     bench_kineto,
+    msprof_kernel_summary,
     print_kernel_table,
+    print_msprof_trace_info,
     print_pta_baseline_wallclock_table,
+    profile_msprof,
 )
 
 ENV_PREFIX = "VLLM_ASCEND_PTA_MC2_TEST"
@@ -316,30 +319,30 @@ def _run_profile(ctx: PtaMoeOpContext) -> None:
     torch.npu.synchronize()
     dist.barrier()
 
-    trace_path = os.path.join(trace_dir, f"rank{ctx.rank}_pta_v2.json")
-    kernel_stats = bench_kineto(
+    trace_root = os.path.join(trace_dir, "pta_v2")
+    worker_name = f"rank{ctx.rank}_pta_v2"
+    profile_msprof(
         partial(ctx.run_dispatch_combine),
-        kernel_names=V2_MOE_KERNELS,
+        trace_root=trace_root,
+        worker_name=worker_name,
         num_tests=num_tests,
-        trace_path=trace_path,
-        suppress_kineto_output=(ctx.rank != 0),
+        suppress_output=(ctx.rank != 0),
     )
     dist.barrier()
 
-    print_kernel_table(
+    summary = msprof_kernel_summary(trace_root, V2_MOE_KERNELS)
+    print_msprof_trace_info(
         rank=ctx.rank,
-        label="PTA MC2 V2 kernels (baseline)",
-        kernel_names=V2_MOE_KERNELS,
-        dispatch_t=kernel_stats[0],
-        combine_t=kernel_stats[1],
+        label="PTA MC2 V2 (baseline)",
+        trace_root=trace_root,
         num_tests=num_tests,
-        trace_path=trace_path,
+        kernel_names=V2_MOE_KERNELS,
+        kernel_durations=summary,
     )
     if ctx.rank == 0:
         print(
-            f"\n  Chrome traces saved under: {trace_dir}\n"
-            "  Files: rank<N>_pta_v2.json\n"
-            "  Open with chrome://tracing or Perfetto UI.\n",
+            f"\n  Full msprof traces saved under: {trace_dir}/pta_v2/\n"
+            "  Inspect ASCEND_PROFILER_OUTPUT/trace_view.json in MindStudio Insight.\n",
             flush=True,
         )
 

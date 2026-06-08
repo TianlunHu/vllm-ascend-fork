@@ -1,15 +1,17 @@
 #!/usr/bin/env bash
 # Run SHMEM zero-buffer MoE dispatch/combine e2e tests (correctness / bench / profile).
 #
-# Profile mode writes Chrome/Kineto JSON traces. Default output directory:
+# Profile mode writes full msprof traces (CPU+NPU, same config as vLLM serving profiler).
+# Default output directory:
 #   <repo-root>/traces/zb_moe_<timestamp>/
-# Files per rank (world_size=R):
-#   rank0_zb_shmem.json, rank0_pta_v2.json, ... rank{R-1}_*.json
+# Per rank:
+#   zb_shmem/rank<N>_zb_shmem.*_ascend_pt/ASCEND_PROFILER_OUTPUT/
+#   pta_v2/rank<N>_pta_v2.*_ascend_pt/ASCEND_PROFILER_OUTPUT/
 #
 # Usage:
 #   ./run_shmem_moe_zb_test.sh                  # correctness
 #   ./run_shmem_moe_zb_test.sh bench            # wall-clock + kineto summary (no trace files)
-#   ./run_shmem_moe_zb_test.sh profile          # export traces + kineto summary
+#   ./run_shmem_moe_zb_test.sh profile          # full msprof trace + optional kernel summary
 #   Compare with PTA baseline: ./run_moe_distribute_v2_baseline_test.sh profile
 #
 # Environment (shape/bench — shared across ZB / PTA / Fused tests):
@@ -109,13 +111,14 @@ python "${TEST_PY}" \
 
 if [[ "${MODE}" == "profile" ]]; then
   echo ""
-  echo "=== Profile traces ==="
+  echo "=== Profile traces (msprof) ==="
   echo "  directory: ${TRACE_DIR}"
-  ls -lh "${TRACE_DIR}"/*.json 2>/dev/null || echo "  (no .json files found — check test logs above)"
+  find "${TRACE_DIR}" -name '*_ascend_pt' -type d 2>/dev/null | head -20 || true
   echo ""
-  echo "  Open with chrome://tracing or https://ui.perfetto.dev/"
-  echo "  ZB path:  rank<N>_zb_shmem.json"
-  echo "  PTA path: rank<N>_pta_v2.json"
+  echo "  Inspect ASCEND_PROFILER_OUTPUT/trace_view.json in MindStudio Insight"
+  echo "  or run: python -c \"from torch_npu.profiler.profiler import analyse; analyse('<path/to/*_ascend_pt>')\""
+  echo "  ZB path:  ${TRACE_DIR}/zb_shmem/"
+  echo "  PTA path: ${TRACE_DIR}/pta_v2/"
 elif [[ "${MODE}" == "bench" ]]; then
   echo ""
   echo "=== bench mode ==="

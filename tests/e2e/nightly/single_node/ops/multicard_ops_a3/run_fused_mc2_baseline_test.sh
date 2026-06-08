@@ -5,11 +5,7 @@
 #   variant 1 (default) → dispatch_ffn_combine      (W8A8, EP<=32)
 #   variant 2           → dispatch_gmm_combine_decode (decode W8A8)
 #
-# Profile traces default directory:
-#   <repo-root>/traces/fused_mc2_baseline_<timestamp>/
-# Files:
-#   rank<N>_fused_mc2_ffn_combine.json       (variant=1)
-#   rank<N>_fused_mc2_gmm_combine_decode.json (variant=2)
+# Profile traces: fused_mc2_<variant>/rank<N>_*.ascend_pt/ (full msprof)
 #
 # Usage:
 #   ./run_fused_mc2_baseline_test.sh
@@ -107,14 +103,15 @@ python "${TEST_PY}" \
 
 if [[ "${MODE}" == "profile" ]]; then
   echo ""
-  echo "=== Profile traces (Fused MC2) ==="
+  echo "=== Profile traces (Fused MC2, msprof) ==="
   echo "  directory: ${TRACE_DIR}"
-  ls -lh "${TRACE_DIR}"/*.json 2>/dev/null || echo "  (no .json files found)"
+  find "${TRACE_DIR}" -name '*_ascend_pt' -type d 2>/dev/null | head -20 || true
   echo ""
   echo "  Compare three serving paths with same shapes:"
   echo "    ./run_fused_mc2_baseline_test.sh profile  # this test"
   echo "    ./run_moe_distribute_v2_baseline_test.sh profile"
   echo "    ./run_shmem_moe_zb_test.sh profile"
+  echo "  Inspect ASCEND_PROFILER_OUTPUT/trace_view.json in MindStudio Insight."
 elif [[ "${MODE}" == "bench" ]]; then
   echo ""
   echo "=== bench mode (Fused MC2) ==="
