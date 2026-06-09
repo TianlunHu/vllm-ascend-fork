@@ -14,10 +14,11 @@
 # Or directly (default world_size=2 for TP=2-like setups):
 #
 #   VLLM_ASCEND_MOE_MC2_TEST_WORLD_SIZE=2 \\
-#   VLLM_ASCEND_MOE_MC2_TEST_NUM_TOKENS=8 \\
-#   VLLM_ASCEND_MOE_MC2_TEST_HIDDEN=128 \\
+#   VLLM_ASCEND_MOE_MC2_TEST_NUM_TOKENS=32 \\
+#   VLLM_ASCEND_MOE_MC2_TEST_HIDDEN=2048 \\
 #   python tests/e2e/nightly/single_node/ops/multicard_ops_a3/test_zb_gmm2_to_combine_x.py
 #
+# Note: CANN grouped matmul requires hidden in [1024, 8192] on A3; do not use 128.
 # Pass criteria (rank 0 prints summary):
 #   1. ``npu_grouped_matmul`` exposes a preallocated output arg (``y`` / ``out`` / ...).
 #   2. GMM output written into ``combine_x`` matches auto-allocated GMM output.
@@ -46,13 +47,27 @@ from vllm_ascend.ops.fused_moe.shmem_runtime import (
 )
 from vllm_ascend.utils import enable_custom_op
 
-from moe_mc2_e2e_common import mc2_hccl_port, mc2_world_size
+from moe_mc2_e2e_common import mc2_hccl_port, mc2_shape_config, mc2_world_size
 from test_shmem_moe_distribute_zero_buffer import (
     ZbMoeOpContext,
     _build_context as _build_zb_context_base,
 )
 
 enable_custom_op()
+
+_GMM_HIDDEN_MIN = 1024
+_GMM_HIDDEN_MAX = 8192
+
+
+def _validate_shape_config(world_size: int) -> dict:
+    cfg = mc2_shape_config(world_size)
+    hidden = cfg["hidden"]
+    if hidden < _GMM_HIDDEN_MIN or hidden > _GMM_HIDDEN_MAX:
+        raise ValueError(
+            f"hidden={hidden} is outside CANN npu_grouped_matmul supported range "
+            f"[{_GMM_HIDDEN_MIN}, {_GMM_HIDDEN_MAX}]; set "
+            "VLLM_ASCEND_MOE_MC2_TEST_HIDDEN=2048 (or another value in range).")
+    return cfg
 
 
 def _gmm_output_kw_candidates() -> tuple[str, ...]:
@@ -118,9 +133,12 @@ def _run_minimal_gmm2(
                 return out, kw
             except TypeError as exc:
                 last_err = exc
+                continue
         raise RuntimeError(
-            f"rank {ctx.rank}: npu_grouped_matmul does not accept preallocated "
-            f"output via {_gmm_output_kw_candidates()}; last error: {last_err!r}")
+            f"rank {ctx.rank}: npu_grouped_matmul rejected preallocated output kwargs "
+            f"{_gmm_output_kw_candidates()}; last TypeError: {last_err!r}. "
+            "torch_npu may wrap the op as **kwargs only — inspect CANN docs or try "
+            "aclnnMoeGroupedMatmul with an explicit out tensor list.")
 
     out = torch_npu.npu_grouped_matmul(**base_kwargs)[0]
     return out, None
@@ -183,12 +201,32 @@ def _verify_once(ctx: ZbMoeOpContext) -> Gmm2CombineXResult:
     rows = _gmm_rows(ctx)
 
     # --- Step 1: auto-alloc gmm2 (baseline tensor) ---
-    gmm_auto, _ = _run_minimal_gmm2(ctx, rows, out_buf=None)
+    try:
+        gmm_auto, _ = _run_minimal_gmm2(ctx, rows, out_buf=None)
+    except Exception as exc:
+        return Gmm2CombineXResult(
+            rank=ctx.rank,
+            gmm_y_kw=None,
+            gmm_into_shmem_ok=False,
+            combine_match=False,
+            max_abs_diff=-1.0,
+            message=f"gmm2 auto-alloc failed: {exc!r}",
+        )
 
     # --- Step 2: try writing gmm2 directly into SHMEM combine_x ---
     shmem_out = ctx.bundle.combine_x[:rows]
     shmem_out.zero_()
-    _, y_kw = _run_minimal_gmm2(ctx, rows, out_buf=shmem_out)
+    try:
+        _, y_kw = _run_minimal_gmm2(ctx, rows, out_buf=shmem_out)
+    except Exception as exc:
+        return Gmm2CombineXResult(
+            rank=ctx.rank,
+            gmm_y_kw=None,
+            gmm_into_shmem_ok=False,
+            combine_match=False,
+            max_abs_diff=-1.0,
+            message=f"gmm2 into combine_x failed: {exc!r}",
+        )
     torch.npu.synchronize()
 
     gmm_shmem_ok = torch.allclose(
@@ -211,6 +249,7 @@ def _verify_once(ctx: ZbMoeOpContext) -> Gmm2CombineXResult:
     # --- Step 3: combine with ori_x=gmm_auto (kernel copy path) ---
     _run_zb_dispatch(ctx)
     torch.npu.synchronize()
+    rows = _gmm_rows(ctx)
     gmm_auto2, _ = _run_minimal_gmm2(ctx, rows, out_buf=None)
     combined_ref = torch.empty_like(ctx.combined_x)
     _run_zb_combine(ctx, combined_ref, ori_x=gmm_auto2)
@@ -219,6 +258,7 @@ def _verify_once(ctx: ZbMoeOpContext) -> Gmm2CombineXResult:
     # --- Step 4: combine with ori_x=None (gmm already in combine_x) ---
     _run_zb_dispatch(ctx)
     torch.npu.synchronize()
+    rows = _gmm_rows(ctx)
     shmem_out2 = ctx.bundle.combine_x[:rows]
     shmem_out2.zero_()
     _run_minimal_gmm2(ctx, rows, out_buf=shmem_out2)
@@ -263,15 +303,25 @@ def _worker(rank: int, world_size: int, port: int, results: mp.SimpleQueue) -> N
         dist.barrier()
 
         if rank == 0:
+            cfg = _validate_shape_config(world_size)
+            print(
+                f"[rank0] shape: tokens={cfg['num_tokens']} hidden={cfg['hidden']} "
+                f"topk={cfg['num_topk']} experts={cfg['num_experts']} "
+                f"world_size={world_size}",
+                flush=True,
+            )
             sig = inspect.signature(torch_npu.npu_grouped_matmul)
             print(
-                f"[rank0] npu_grouped_matmul params: {list(sig.parameters.keys())}",
+                f"[rank0] npu_grouped_matmul signature: {sig} "
+                "(torch_npu often wraps CANN ops as *args/**kwargs)",
                 flush=True,
             )
             print(
-                f"[rank0] prealloc output kw candidates: {_gmm_output_kw_candidates()}",
+                f"[rank0] will probe prealloc output kwargs: {_gmm_output_kw_candidates()}",
                 flush=True,
             )
+        else:
+            _validate_shape_config(world_size)
 
         result = _verify_once(ctx)
         dist.barrier()
@@ -343,6 +393,7 @@ def main() -> None:
         description="Verify gmm2 output can be written into SHMEM combine_x (Plan A1)")
     parser.add_argument("--world-size", type=int, default=mc2_world_size())
     args = parser.parse_args()
+    _validate_shape_config(args.world_size)
     results = _launch(args.world_size)
     _print_summary(results)
 
