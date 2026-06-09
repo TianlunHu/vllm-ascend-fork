@@ -34,6 +34,9 @@ SHMEM_POOL_ALIGN_BYTES = 2 * 1024 * 1024
 
 DEFAULT_COMM_ALG = "fullmesh_v1"
 
+# Process-wide runtime created by ensure_zb_shmem_process_initialized().
+_ZB_PROCESS_RUNTIME: ShmemMoERuntime | None = None
+
 
 def _env_int(name: str, default: int) -> int:
     raw = os.getenv(name)
@@ -127,6 +130,92 @@ def estimate_local_mem_size(
 
     total = ext_bytes + data_bytes + fixed_bytes + slack_bytes
     return _round_up(total, SHMEM_POOL_ALIGN_BYTES)
+
+
+def estimate_zb_early_local_mem_size(
+    *,
+    max_tokens_per_rank: int,
+    ep_world_size: int,
+    hidden_size: int,
+    moe_expert_num: int,
+    use_quant: bool = False,
+) -> tuple[int, int]:
+    """Conservative aclshmem pool sizing for early (startup) init.
+
+    Returns ``(local_mem_size, max_recv_tokens)``.
+    """
+    if moe_expert_num <= 0 or hidden_size <= 0:
+        raise ValueError("moe_expert_num and hidden_size must be positive")
+    if moe_expert_num % ep_world_size != 0:
+        raise ValueError(
+            f"moe_expert_num={moe_expert_num} must be divisible by "
+            f"ep_world_size={ep_world_size}")
+    num_local_experts = moe_expert_num // ep_world_size
+    max_recv_tokens = compute_low_latency_max_recv_tokens(
+        num_tokens_per_rank=max_tokens_per_rank,
+        ep_world_size=ep_world_size,
+        num_local_experts=num_local_experts,
+    )
+    local_mem_size = estimate_local_mem_size(
+        max_recv_tokens,
+        hidden_size,
+        use_quant=use_quant,
+        moe_expert_num=moe_expert_num,
+        ep_world_size=ep_world_size,
+    )
+    return local_mem_size, max_recv_tokens
+
+
+def get_zb_shmem_process_runtime() -> ShmemMoERuntime | None:
+    return _ZB_PROCESS_RUNTIME
+
+
+def ensure_zb_shmem_process_initialized(
+    rank: int,
+    world_size: int,
+    local_mem_size: int,
+    server_ip_port: str,
+) -> ShmemMoERuntime:
+    """Bring up aclshmem once per process (mirrors MC2 HCCL init at worker startup)."""
+    global _ZB_PROCESS_RUNTIME
+    if _ZB_PROCESS_RUNTIME is not None:
+        if not _ZB_PROCESS_RUNTIME.is_initialized():
+            raise RuntimeError(
+                "ZB SHMEM process runtime exists but aclshmem is not initialized.")
+        return _ZB_PROCESS_RUNTIME
+
+    if not server_ip_port:
+        raise RuntimeError(
+            "VLLM_ASCEND_ENABLE_ZB_SHMEM=1 but VLLM_ASCEND_ZB_SHMEM_URI is unset. "
+            "Set it to e.g. tcp://<host>:<port> (identical across all EP ranks).")
+
+    runtime = ShmemMoERuntime(
+        rank=rank,
+        world_size=world_size,
+        server_ip_port=server_ip_port,
+        local_mem_size=local_mem_size,
+    )
+    device_ctx = describe_zb_device_context()
+    logger.warning(
+        "[ZB-SHMEM] process init starting rank=%d world_size=%d uri=%s "
+        "local_mem_size=%.1fMiB device_ctx=%s",
+        rank,
+        world_size,
+        server_ip_port,
+        local_mem_size / (1024 * 1024),
+        device_ctx,
+    )
+    runtime.init()
+    _ZB_PROCESS_RUNTIME = runtime
+    logger.warning(
+        "[ZB-SHMEM] process init done rank=%d world_size=%d my_pe=%d "
+        "local_mem_size=%.1fMiB",
+        runtime.rank,
+        world_size,
+        runtime.rank,
+        local_mem_size / (1024 * 1024),
+    )
+    return runtime
 
 
 @dataclass
