@@ -23,12 +23,11 @@
 from abc import ABC, abstractmethod
 from typing import Generic
 
-import logging
-
 import torch
 import torch_npu
 from vllm.config import get_current_vllm_config
 from vllm.distributed.parallel_state import get_ep_group
+from vllm.logger import logger
 
 import vllm_ascend.envs as envs_ascend
 from vllm_ascend.ascend_config import get_ascend_config
@@ -56,7 +55,107 @@ from vllm_ascend.utils import (
 EXPERT_TOKEN_NUMS_TYPE_CUMSUM = 0
 EXPERT_TOKEN_NUMS_TYPE_COUNT = 1
 
-logger = logging.getLogger(__name__)
+# Process-wide ZB graph diagnostics (ep_rank 0 only, gated by debug env).
+_ZB_GRAPH_DIAG_TOTALS: dict[str, int] = {"dispatch": 0, "combine": 0}
+_ZB_GRAPH_DIAG_HINT_EMITTED = False
+
+
+def _zb_graph_debug_enabled() -> bool:
+    raw = envs_ascend.VLLM_ASCEND_ZB_SHMEM_DEBUG
+    return raw not in ("", "0", "false", "False")
+
+
+def _zb_graph_diag_fields() -> tuple[bool, bool, str, object | None]:
+    """Return stream_capturing, forward_context.capturing, cudagraph_mode, batch_tokens."""
+    stream_capturing = torch.npu.is_current_stream_capturing()
+    fc_capturing = False
+    cudagraph_mode = "NONE"
+    batch_tokens = None
+    try:
+        from vllm.forward_context import get_forward_context
+
+        fwd_ctx = get_forward_context()
+        fc_capturing = bool(getattr(fwd_ctx, "capturing", False))
+        mode = getattr(fwd_ctx, "cudagraph_runtime_mode", None)
+        if mode is not None:
+            cudagraph_mode = getattr(mode, "name", str(mode))
+        batch_desc = getattr(fwd_ctx, "batch_descriptor", None)
+        if batch_desc is not None:
+            batch_tokens = getattr(batch_desc, "num_tokens", None)
+    except Exception:
+        pass
+    return stream_capturing, fc_capturing, cudagraph_mode, batch_tokens
+
+
+def _should_emit_zb_graph_log(total: int) -> bool:
+    return total <= 10 or total in (50, 100, 500, 1000) or total % 1000 == 0
+
+
+def _log_zb_graph_hint(ep_rank_id: int) -> None:
+    global _ZB_GRAPH_DIAG_HINT_EMITTED
+    if _ZB_GRAPH_DIAG_HINT_EMITTED or ep_rank_id != 0 or not _zb_graph_debug_enabled():
+        return
+    _ZB_GRAPH_DIAG_HINT_EMITTED = True
+    logger.warning(
+        "[ZB-GRAPH] diagnose: compare total dispatch/combine counters before vs after "
+        "a decode-heavy request on ep_rank=0. If totals keep growing during decode, "
+        "ZB is running outside ACLGraph replay (not in graph). If totals only move "
+        "during startup/prefill and stay flat during decode, ZB is likely in graph. "
+        "stream_capturing=True during startup means the op was recorded into NPUGraph."
+    )
+
+
+def _log_zb_graph_op(
+    phase: str,
+    *,
+    ep_rank_id: int,
+    local_call: int,
+    detail: str = "",
+) -> None:
+    global _ZB_GRAPH_DIAG_TOTALS
+    _log_zb_graph_hint(ep_rank_id)
+
+    _ZB_GRAPH_DIAG_TOTALS[phase] += 1
+    total = _ZB_GRAPH_DIAG_TOTALS[phase]
+
+    stream_capturing, fc_capturing, cudagraph_mode, batch_tokens = _zb_graph_diag_fields()
+    in_graph_capture = stream_capturing or fc_capturing
+
+    if _zb_graph_debug_enabled():
+        if ep_rank_id != 0 or not _should_emit_zb_graph_log(total):
+            return
+        logger.warning(
+            "[ZB-GRAPH] %s total=%d local=#%d ep_rank=%d "
+            "stream_capturing=%s fc_capturing=%s in_graph_capture=%s "
+            "cudagraph_mode=%s batch_tokens=%s%s",
+            phase,
+            total,
+            local_call,
+            ep_rank_id,
+            stream_capturing,
+            fc_capturing,
+            in_graph_capture,
+            cudagraph_mode,
+            batch_tokens,
+            f" {detail}" if detail else "",
+        )
+        return
+
+    if not TokenDispatcherWithMC2._should_log_zb_call(local_call):
+        return
+    logger.warning(
+        "[ZB-SHMEM] %s local=#%d ep_rank=%d total=%d "
+        "stream_capturing=%s fc_capturing=%s cudagraph_mode=%s batch_tokens=%s%s",
+        phase,
+        local_call,
+        ep_rank_id,
+        total,
+        stream_capturing,
+        fc_capturing,
+        cudagraph_mode,
+        batch_tokens,
+        f" {detail}" if detail else "",
+    )
 
 
 def _get_expert_token_nums_type(token_dispatch_input: MoETokenDispatchInput) -> int:
@@ -452,27 +551,17 @@ class TokenDispatcherWithMC2(MoETokenDispatcher[MoEMC2CombineMetadata]):
         runtime = self._zb_runtime
 
         self._zb_dispatch_calls += 1
-        if self._should_log_zb_call(self._zb_dispatch_calls):
-            # WARNING: vLLM worker subprocesses often hide INFO; keep at
-            # WARNING until ZB serving is verified, then remove.
-            logger.warning(
-                "[ZB-SHMEM] dispatch call #%d ep_rank=%d x_shape=%s "
-                "expert_ids_shape=%s expand_x_out_shape=%s expand_x_dtype=%s "
-                "quant_mode=%d global_bs=%d expert_token_nums_type=%d "
-                "has_mc2_mask=%s moe_expert_num=%d max_recv_tokens=%d",
-                self._zb_dispatch_calls,
-                self.ep_rank_id,
-                tuple(hidden_states.shape),
-                tuple(topk_ids.shape),
-                tuple(bundle.expand_x_out.shape),
-                bundle.expand_x_out.dtype,
-                quant_mode,
-                self.global_bs,
-                expert_token_nums_type,
-                routing.mc2_mask is not None,
-                moe_expert_num,
-                self._zb_max_recv_tokens,
-            )
+        _log_zb_graph_op(
+            "dispatch",
+            ep_rank_id=self.ep_rank_id,
+            local_call=self._zb_dispatch_calls,
+            detail=(
+                f"x_shape={tuple(hidden_states.shape)} "
+                f"expert_ids_shape={tuple(topk_ids.shape)} "
+                f"quant_mode={quant_mode} global_bs={self.global_bs} "
+                f"moe_expert_num={moe_expert_num}"
+            ),
+        )
 
         # GMM calls dispose_tensor() on the dispatch output when dynamic_scale is
         # set; that must not touch the persistent SHMEM expand_x_out buffer.
@@ -666,22 +755,15 @@ class TokenDispatcherWithMC2(MoETokenDispatcher[MoEMC2CombineMetadata]):
         )
 
         self._zb_combine_calls += 1
-        if self._should_log_zb_call(self._zb_combine_calls):
-            logger.warning(
-                "[ZB-SHMEM] combine call #%d ep_rank=%d gmm_rows=%d expand_x_shape=%s "
-                "ori_x_shape=%s combined_x_shape=%s comm_quant_mode=%d "
-                "global_bs=%d has_mc2_mask=%s has_expand_scales=%s",
-                self._zb_combine_calls,
-                self.ep_rank_id,
-                num_expert_rows,
-                tuple(expand_x.shape),
-                None if ori_x is None else tuple(ori_x.shape),
-                tuple(combined_x.shape),
-                comm_quant_mode,
-                self.global_bs,
-                combine_metadata.mc2_mask is not None,
-                expand_scales is not None,
-            )
+        _log_zb_graph_op(
+            "combine",
+            ep_rank_id=self.ep_rank_id,
+            local_call=self._zb_combine_calls,
+            detail=(
+                f"gmm_rows={num_expert_rows} combined_x_shape={tuple(combined_x.shape)} "
+                f"comm_quant_mode={comm_quant_mode} global_bs={self.global_bs}"
+            ),
+        )
 
         shmem_moe_distribute_combine_zero_buffer(
             expand_x=expand_x,
