@@ -315,6 +315,32 @@ at::Tensor &shmem_moe_distribute_combine_zero_buffer_meta(
 {
     return combined_x;
 }
+
+at::Tensor &zb_moe_grouped_matmul_gmm2_out_meta(
+    const at::Tensor &x,
+    const at::TensorList &weight,
+    const c10::optional<at::TensorList> &scale,
+    const c10::optional<at::TensorList> &per_token_scale,
+    const c10::optional<at::TensorList> &bias,
+    const at::Tensor &group_list,
+    at::Tensor &out,
+    int64_t split_item,
+    int64_t group_type,
+    int64_t group_list_type,
+    int64_t act_type)
+{
+    (void)x;
+    (void)weight;
+    (void)scale;
+    (void)per_token_scale;
+    (void)bias;
+    (void)group_list;
+    (void)split_item;
+    (void)group_type;
+    (void)group_list_type;
+    (void)act_type;
+    return out;
+}
 #endif
 
 at::Tensor npu_lightning_indexer_meta(
@@ -1654,6 +1680,8 @@ TORCH_LIBRARY_IMPL_EXPAND(CONCAT(_C, _ascend), Meta, ops) {
              &vllm_ascend::meta::shmem_moe_distribute_dispatch_zero_buffer_meta);
     ops.impl("shmem_moe_distribute_combine_zero_buffer",
              &vllm_ascend::meta::shmem_moe_distribute_combine_zero_buffer_meta);
+    ops.impl("zb_moe_grouped_matmul_gmm2_out",
+             &vllm_ascend::meta::zb_moe_grouped_matmul_gmm2_out_meta);
 #endif
     // matmul allreduce add rmsnorm
     ops.impl("matmul_allreduce_add_rmsnorm", &vllm_ascend::meta::matmul_allreduce_add_rmsnorm_meta);

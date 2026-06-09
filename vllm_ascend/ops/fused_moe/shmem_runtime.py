@@ -566,3 +566,34 @@ def shmem_moe_distribute_combine_zero_buffer(
         const_expert_num,
         combined_x,
     )
+
+
+def zb_moe_grouped_matmul_gmm2_out(
+    x: torch.Tensor,
+    weight: list[torch.Tensor],
+    group_list: torch.Tensor,
+    out: torch.Tensor,
+    *,
+    scale: list[torch.Tensor] | None = None,
+    per_token_scale: list[torch.Tensor] | None = None,
+    bias: list[torch.Tensor] | None = None,
+    split_item: int = 2,
+    group_type: int = 0,
+    group_list_type: int = 0,
+    act_type: int = 0,
+) -> torch.Tensor:
+    """ZB-only gmm2: write grouped matmul output into preallocated SHMEM ``out``."""
+    _ensure_zb_op_available("zb_moe_grouped_matmul_gmm2_out")
+    return torch.ops._C_ascend.zb_moe_grouped_matmul_gmm2_out(
+        x,
+        weight,
+        scale,
+        per_token_scale,
+        bias,
+        group_list,
+        out,
+        split_item,
+        group_type,
+        group_list_type,
+        act_type,
+    )

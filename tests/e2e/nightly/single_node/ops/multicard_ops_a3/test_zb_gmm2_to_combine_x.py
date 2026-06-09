@@ -20,14 +20,12 @@
 #
 # Note: CANN grouped matmul requires hidden in [1024, 8192] on A3; do not use 128.
 # Pass criteria (rank 0 prints summary):
-#   1. ``npu_grouped_matmul`` exposes a preallocated output arg (``y`` / ``out`` / ...).
-#   2. GMM output written into ``combine_x`` matches auto-allocated GMM output.
-#   3. ``combine(ori_x=gmm_out)`` matches ``combine(ori_x=None)`` after (2).
+#   1. ``zb_moe_grouped_matmul_gmm2_out`` writes into ``combine_x`` slice.
+#   2. ``combine(ori_x=gmm_out)`` matches ``combine(ori_x=None)`` after (1).
 
 from __future__ import annotations
 
 import argparse
-import inspect
 import random
 import sys
 from dataclasses import dataclass
@@ -44,6 +42,7 @@ import torch_npu
 from vllm_ascend.ops.fused_moe.shmem_runtime import (
     shmem_moe_distribute_combine_zero_buffer,
     shmem_moe_distribute_dispatch_zero_buffer,
+    zb_moe_grouped_matmul_gmm2_out,
 )
 from vllm_ascend.utils import enable_custom_op
 
@@ -75,18 +74,6 @@ def _validate_shape_config(world_size: int) -> dict:
     return cfg
 
 
-def _gmm_output_kw_candidates() -> tuple[str, ...]:
-    """Parameter names used by different CANN/torch_npu builds for preallocated GMM output."""
-    try:
-        params = inspect.signature(torch_npu.npu_grouped_matmul).parameters
-    except (TypeError, ValueError):
-        return ("y", "out", "output", "y_out")
-    names = set(params)
-    ordered = ("y", "out", "output", "y_out")
-    found = [n for n in ordered if n in names]
-    return tuple(found) if found else ordered
-
-
 def _gmm_rows(ctx: ZbMoeOpContext) -> int:
     counts = ctx.aux["expert_token_nums"]
     rows = int(counts.sum().item())
@@ -116,36 +103,31 @@ def _run_minimal_gmm2(
     device = ctx.device
     x = ctx.bundle.expand_x_out[:rows].detach()
 
-    # Near-identity weight: output ~= input when writing succeeds.
     w = torch.eye(hidden, dtype=torch.bfloat16, device=device).unsqueeze(0)
     group_list = torch.tensor([rows], dtype=torch.int64, device=device)
 
-    base_kwargs = dict(
-        x=[x],
-        weight=[w],
-        split_item=2,
-        group_list_type=0,
-        group_type=0,
-        group_list=group_list,
-        output_dtype=torch.bfloat16,
-    )
-
     if out_buf is not None:
-        last_err: Exception | None = None
-        for kw in _gmm_output_kw_candidates():
-            try:
-                out = torch_npu.npu_grouped_matmul(**base_kwargs, **{kw: [out_buf]})[0]
-                return out, kw
-            except TypeError as exc:
-                last_err = exc
-                continue
-        raise RuntimeError(
-            f"rank {ctx.rank}: npu_grouped_matmul rejected preallocated output kwargs "
-            f"{_gmm_output_kw_candidates()}; last TypeError: {last_err!r}. "
-            "torch_npu may wrap the op as **kwargs only — inspect CANN docs or try "
-            "aclnnMoeGroupedMatmul with an explicit out tensor list.")
+        zb_moe_grouped_matmul_gmm2_out(
+            x,
+            [w],
+            group_list,
+            out_buf,
+            split_item=2,
+            group_type=0,
+            group_list_type=0,
+        )
+        return out_buf, "zb_moe_grouped_matmul_gmm2_out"
 
-    out = torch_npu.npu_grouped_matmul(**base_kwargs)[0]
+    out = torch.empty((rows, hidden), dtype=torch.bfloat16, device=device)
+    zb_moe_grouped_matmul_gmm2_out(
+        x,
+        [w],
+        group_list,
+        out,
+        split_item=2,
+        group_type=0,
+        group_list_type=0,
+    )
     return out, None
 
 
@@ -315,16 +297,7 @@ def _worker(rank: int, world_size: int, port: int, results: mp.SimpleQueue) -> N
                 f"world_size={world_size}",
                 flush=True,
             )
-            sig = inspect.signature(torch_npu.npu_grouped_matmul)
-            print(
-                f"[rank0] npu_grouped_matmul signature: {sig} "
-                "(torch_npu often wraps CANN ops as *args/**kwargs)",
-                flush=True,
-            )
-            print(
-                f"[rank0] will probe prealloc output kwargs: {_gmm_output_kw_candidates()}",
-                flush=True,
-            )
+            print("[rank0] using torch.ops._C_ascend.zb_moe_grouped_matmul_gmm2_out", flush=True)
         else:
             _validate_shape_config(world_size)
 
@@ -350,6 +323,10 @@ def _launch(world_size: int) -> list[Gmm2CombineXResult]:
     if not hasattr(torch.ops._C_ascend, "shmem_moe_distribute_dispatch_zero_buffer"):
         raise RuntimeError(
             "ZB ops not registered; rebuild vllm_ascend_C with VLLM_ASCEND_ENABLE_ZB_OPS=1")
+    if not hasattr(torch.ops._C_ascend, "zb_moe_grouped_matmul_gmm2_out"):
+        raise RuntimeError(
+            "zb_moe_grouped_matmul_gmm2_out not registered; rebuild vllm_ascend_C with "
+            "VLLM_ASCEND_ENABLE_ZB_OPS=1")
 
     port = mc2_hccl_port() + random.randint(0, 10000)
     mp.set_start_method("fork", force=True)
@@ -381,13 +358,6 @@ def _print_summary(results: list[Gmm2CombineXResult]) -> None:
     failures = [r for r in results if r.message.startswith("ERROR") or not r.combine_match]
     if failures:
         print("\nRESULT: FAIL — see rank lines above.", flush=True)
-        if any(not r.gmm_into_shmem_ok for r in results if not r.message.startswith("ERROR")):
-            print(
-                "  Hint: if gmm_into_shmem=False, your CANN build may not expose "
-                "``y``/``out`` on npu_grouped_matmul; try aclnnMoeGroupedMatmul or "
-                "extend the Python wrapper.",
-                flush=True,
-            )
         raise SystemExit(1)
 
     print("\nRESULT: PASS — gmm2 can target SHMEM combine_x; combine(ori_x=None) matches.", flush=True)

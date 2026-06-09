@@ -47,6 +47,7 @@
 #ifdef VLLM_ASCEND_ENABLE_ZB_OPS
 #include "mc2/shmem_moe_distribute_dispatch_zero_buffer/shmem_moe_distribute_dispatch_zero_buffer_torch_adpt.h"
 #include "mc2/shmem_moe_distribute_combine_zero_buffer/shmem_moe_distribute_combine_zero_buffer_torch_adpt.h"
+#include "mc2/zb_moe_grouped_matmul_gmm2_out/zb_moe_grouped_matmul_gmm2_out_torch_adpt.h"
 #endif
 #include "moe/moe_gating_top_k/moe_gating_top_k_torch_adpt.h"
 #include "moe/moe_init_routing_custom/moe_init_routing_custom_torch_adpt.h"
@@ -2455,6 +2456,16 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
         ") -> Tensor");
     ops.impl("shmem_moe_distribute_combine_zero_buffer", torch::kPrivateUse1,
              &vllm_ascend::shmem_moe_distribute_combine_zero_buffer);
+
+    ops.def(
+        "zb_moe_grouped_matmul_gmm2_out("
+        "    Tensor x, Tensor[] weight,"
+        "    Tensor[]? scale, Tensor[]? per_token_scale, Tensor[]? bias,"
+        "    Tensor group_list, Tensor(a!) out,"
+        "    int split_item, int group_type, int group_list_type, int act_type"
+        ") -> Tensor");
+    ops.impl("zb_moe_grouped_matmul_gmm2_out", torch::kPrivateUse1,
+             &vllm_ascend::zb_moe_grouped_matmul_gmm2_out);
 #endif
 
     ops.def(

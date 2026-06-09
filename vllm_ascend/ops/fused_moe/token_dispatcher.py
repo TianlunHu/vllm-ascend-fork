@@ -669,11 +669,15 @@ class TokenDispatcherWithMC2(MoETokenDispatcher[MoEMC2CombineMetadata]):
             expert_token_nums_type=expert_token_nums_type,
         )
 
+        expert_rows = int(aux["expert_token_nums"].sum().item())
+        gmm2_out = bundle.combine_x[:expert_rows] if expert_rows > 0 else None
+
         return MoETokenDispatchOutput(
             hidden_states=expand_x_for_gmm,
             dynamic_scale=aux["dynamic_scales"] if use_quant else None,
             group_list=aux["expert_token_nums"],
             group_list_type=expert_token_nums_type,
+            gmm2_out=gmm2_out,
             combine_metadata=MoEMC2CombineMetadata(
                 topk_ids=topk_ids,
                 topk_weights=token_dispatch_input.topk_weights,
@@ -811,9 +815,7 @@ class TokenDispatcherWithMC2(MoETokenDispatcher[MoEMC2CombineMetadata]):
         quant = combine_metadata.quant
         comm_quant_mode = self._compute_comm_quant_mode(quant)
 
-        # Combine reads peer data from SHMEM ``combine_x``. Local GMM output lives in
-        # a separate tensor; ``CopyValidExpandXToShmem`` copies ``ori_x`` -> ``expand_x``
-        # inside the kernel (quant and non-quant). Do not copy on the Python side.
+        # GMM2 writes directly into SHMEM ``combine_x`` via ``zb_moe_grouped_matmul_gmm2_out``.
         num_expert_rows = hidden_states.size(0)
         expand_x = bundle.combine_x
         if num_expert_rows > expand_x.size(0):
@@ -821,7 +823,7 @@ class TokenDispatcherWithMC2(MoETokenDispatcher[MoEMC2CombineMetadata]):
                 f"ZB SHMEM combine: GMM output rows {num_expert_rows} exceed "
                 f"combine_x capacity {expand_x.size(0)}."
             )
-        ori_x = hidden_states if num_expert_rows > 0 else None
+        ori_x = None
 
         expand_scales = None
         if comm_quant_mode == 2 and self._zb_aux is not None:
