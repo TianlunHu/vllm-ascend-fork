@@ -16,8 +16,6 @@
 #ifndef ZB_MOE_GROUPED_MATMUL_GMM2_OUT_TORCH_ADPT_H
 #define ZB_MOE_GROUPED_MATMUL_GMM2_OUT_TORCH_ADPT_H
 
-#include "aclnn_torch_adapter/op_api_common.h"
-
 namespace vllm_ascend {
 
 inline at::TensorList EmptyTensorList()
