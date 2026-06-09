@@ -67,6 +67,11 @@ def _validate_shape_config(world_size: int) -> dict:
             f"hidden={hidden} is outside CANN npu_grouped_matmul supported range "
             f"[{_GMM_HIDDEN_MIN}, {_GMM_HIDDEN_MAX}]; set "
             "VLLM_ASCEND_MOE_MC2_TEST_HIDDEN=2048 (or another value in range).")
+    if cfg["num_topk"] > cfg["num_experts"]:
+        raise ValueError(
+            f"num_topk={cfg['num_topk']} exceeds num_experts={cfg['num_experts']}; "
+            "set VLLM_ASCEND_MOE_MC2_TEST_NUM_EXPERTS >= num_topk "
+            "(default for world_size=2 is 16).")
     return cfg
 
 

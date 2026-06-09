@@ -99,6 +99,9 @@ def mc2_shape_config(world_size: int) -> dict:
         str(max(world_size * 2, 16)),
     )
     assert num_experts % world_size == 0, "num_experts must be divisible by world_size"
+    assert num_topk <= num_experts, (
+        f"num_topk={num_topk} must be <= num_experts={num_experts} "
+        "(build_fixed_inputs uses random.sample without replacement)")
     num_local_experts = num_experts // world_size
     global_bs = num_tokens * world_size
     return {
