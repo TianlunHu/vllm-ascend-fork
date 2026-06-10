@@ -18,29 +18,6 @@
 
 namespace vllm_ascend {
 
-inline at::TensorList EmptyTensorList()
-{
-    static std::vector<at::Tensor> kEmpty;
-    return at::TensorList(kEmpty);
-}
-
-inline at::TensorList SingleTensorList(const at::Tensor &tensor)
-{
-    static thread_local std::vector<at::Tensor> holder;
-    holder.assign(1, tensor);
-    return at::TensorList(holder);
-}
-
-inline at::TensorList ToTensorList(const at::Tensor &tensor)
-{
-    return SingleTensorList(tensor);
-}
-
-inline at::TensorList ToTensorList(const at::TensorList &tensor_list)
-{
-    return tensor_list;
-}
-
 // ZB-only grouped matmul: write gmm2 output into caller-provided SHMEM ``out``.
 // Uses CANN ``aclnnGroupedMatmulWeightNz`` (NZ weight, W8A8/per-token quant path).
 at::Tensor &zb_moe_grouped_matmul_gmm2_out(
@@ -57,55 +34,64 @@ at::Tensor &zb_moe_grouped_matmul_gmm2_out(
     int64_t act_type)
 {
     TORCH_CHECK(out.defined(), "zb_moe_grouped_matmul_gmm2_out: out must be defined");
-    TORCH_CHECK(out.is_npu(), "zb_moe_grouped_matmul_gmm2_out: out must be on NPU");
-    TORCH_CHECK(x.is_npu(), "zb_moe_grouped_matmul_gmm2_out: x must be on NPU");
+    TORCH_CHECK(out.is_privateuseone(), "zb_moe_grouped_matmul_gmm2_out: out must be on NPU");
+    TORCH_CHECK(x.is_privateuseone(), "zb_moe_grouped_matmul_gmm2_out: x must be on NPU");
     TORCH_CHECK(weight.size() > 0, "zb_moe_grouped_matmul_gmm2_out: weight must not be empty");
 
-    const at::TensorList x_list = ToTensorList(x);
-    const at::TensorList y_list = ToTensorList(out);
-    const at::TensorList scale_list = scale.has_value() ? scale.value() : EmptyTensorList();
-    const at::TensorList per_token_scale_list =
-        per_token_scale.has_value() ? per_token_scale.value() : EmptyTensorList();
-    const at::TensorList bias_list = bias.has_value() ? bias.value() : EmptyTensorList();
+    std::vector<at::Tensor> x_vec = {x};
+    std::vector<at::Tensor> y_vec = {out};
+    at::TensorList x_list(x_vec);
+    at::TensorList y_list(y_vec);
+
+    const c10::optional<at::TensorList> empty_list;
+    const c10::optional<at::IntArrayRef> empty_int_array;
     const bool use_quant = scale.has_value() && scale.value().size() > 0;
 
     if (use_quant) {
+        const int64_t quant_group_size = 0;
         EXEC_NPU_CMD(aclnnGroupedMatmulWeightNz,
                      x_list,
                      weight,
-                     bias_list,
-                     scale_list,
-                     EmptyTensorList(),
-                     EmptyTensorList(),
-                     EmptyTensorList(),
-                     per_token_scale_list,
+                     bias,
+                     scale,
+                     empty_list,
+                     empty_list,
+                     empty_list,
+                     per_token_scale,
                      group_list,
+                     empty_list,
+                     empty_list,
+                     empty_list,
                      split_item,
                      group_type,
                      group_list_type,
                      act_type,
-                     y_list);
+                     empty_int_array,
+                     quant_group_size,
+                     y_list,
+                     empty_list,
+                     empty_list);
     } else {
         EXEC_NPU_CMD(aclnnGroupedMatmulV4,
                      x_list,
                      weight,
-                     bias_list,
-                     EmptyTensorList(),
-                     EmptyTensorList(),
-                     EmptyTensorList(),
-                     EmptyTensorList(),
-                     per_token_scale_list,
+                     bias,
+                     empty_list,
+                     empty_list,
+                     empty_list,
+                     empty_list,
+                     per_token_scale,
                      group_list,
-                     EmptyTensorList(),
-                     EmptyTensorList(),
-                     EmptyTensorList(),
+                     empty_list,
+                     empty_list,
+                     empty_list,
                      split_item,
                      group_type,
                      group_list_type,
                      act_type,
                      y_list,
-                     EmptyTensorList(),
-                     EmptyTensorList());
+                     empty_list,
+                     empty_list);
     }
 
     return out;
