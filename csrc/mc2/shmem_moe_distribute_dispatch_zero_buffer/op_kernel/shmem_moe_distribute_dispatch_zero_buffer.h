@@ -863,9 +863,9 @@ __aicore__ inline void ShmemMoeDistributeDispatchZeroBuffer<TemplateMC2TypeFunc>
         WaitNotify();
         SyncAll<true>();
         InputToDstOutput();
-        SetSyncFlag();
-        WaitSyncFlag();
-        SyncAll<true>();
+        // SetSyncFlag();
+        // WaitSyncFlag();
+        // SyncAll<true>();
         CleanUp();
     }
 }

@@ -449,10 +449,10 @@ __aicore__ inline void ShmemMoeDistributeCombineZeroBuffer<TemplateMC2TypeFunc>:
             CopyValidExpandXToShmem();
             SyncAll<true>();
             tpipe_->Reset();
-            SetSyncFlag();
-            WaitSyncFlag();
-            SyncAll<true>();
         }
+        SetSyncFlag();
+        WaitSyncFlag();
+        SyncAll<true>();
         InputToDstOutput();
     }
 }
