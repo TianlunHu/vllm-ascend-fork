@@ -643,10 +643,6 @@ class TokenDispatcherWithMC2(MoETokenDispatcher[MoEMC2CombineMetadata]):
             ),
         )
 
-        # GMM calls dispose_tensor() on the dispatch output when dynamic_scale is
-        # set; that must not touch the persistent SHMEM expand_x_out buffer.
-        expand_x_for_gmm = bundle.expand_x_out.detach()
-
         shmem_moe_distribute_dispatch_zero_buffer(
             x=hidden_states,
             expert_ids=topk_ids,
@@ -669,8 +665,15 @@ class TokenDispatcherWithMC2(MoETokenDispatcher[MoEMC2CombineMetadata]):
             expert_token_nums_type=expert_token_nums_type,
         )
 
+        # GMM calls dispose_tensor() on the dispatch output when dynamic_scale is
+        # set; that must not touch the persistent SHMEM expand_x_out buffer.
+        expand_x_for_gmm = bundle.expand_x_out.detach()
+
         expert_rows = int(aux["expert_token_nums"].sum().item())
-        gmm2_out = bundle.combine_x[:expert_rows] if expert_rows > 0 else None
+        # gmm2_out must share the same physical shape as expand_x_out / combine_x
+        # (max_recv_tokens). Valid token count is carried by group_list /
+        # expert_token_nums, not by slicing the SHMEM buffers.
+        gmm2_out = bundle.combine_x if expert_rows > 0 else None
 
         return MoETokenDispatchOutput(
             hidden_states=expand_x_for_gmm,
