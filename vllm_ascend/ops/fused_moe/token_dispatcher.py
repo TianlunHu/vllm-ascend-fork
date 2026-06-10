@@ -669,11 +669,10 @@ class TokenDispatcherWithMC2(MoETokenDispatcher[MoEMC2CombineMetadata]):
         # set; that must not touch the persistent SHMEM expand_x_out buffer.
         expand_x_for_gmm = bundle.expand_x_out.detach()
 
-        expert_rows = int(aux["expert_token_nums"].sum().item())
-        # gmm2_out must share the same physical shape as expand_x_out / combine_x
-        # (max_recv_tokens). Valid token count is carried by group_list /
-        # expert_token_nums, not by slicing the SHMEM buffers.
-        gmm2_out = bundle.combine_x if expert_rows > 0 else None
+        # Always wire gmm2 into the full combine_x buffer (same shape as expand_x_out).
+        # Valid token count is carried by group_list / expert_token_nums only.
+        # Do not call .item() here: it syncs the NPU stream and breaks ACLGraph capture.
+        gmm2_out = bundle.combine_x
 
         return MoETokenDispatchOutput(
             hidden_states=expand_x_for_gmm,
