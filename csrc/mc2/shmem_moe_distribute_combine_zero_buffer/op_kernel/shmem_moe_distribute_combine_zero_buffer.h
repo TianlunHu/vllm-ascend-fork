@@ -443,12 +443,16 @@ template <TemplateMC2TypeClass>
 __aicore__ inline void ShmemMoeDistributeCombineZeroBuffer<TemplateMC2TypeFunc>::Process()
 {
     if ASCEND_IS_AIV {
-        CopyValidExpandXToShmem();
-        SyncAll<true>();
-        tpipe_->Reset();
-        SetSyncFlag();
-        WaitSyncFlag();
-        // SyncAll<true>();
+        if (needCopyExpandX_) {
+            // Legacy path: copy local ori_x into SHMEM expand_x, then cross-rank
+            // barrier so remote readers see the staged data.
+            CopyValidExpandXToShmem();
+            SyncAll<true>();
+            tpipe_->Reset();
+            SetSyncFlag();
+            WaitSyncFlag();
+            SyncAll<true>();
+        }
         InputToDstOutput();
     }
 }
