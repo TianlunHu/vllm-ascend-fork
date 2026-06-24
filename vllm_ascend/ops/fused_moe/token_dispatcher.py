@@ -301,7 +301,8 @@ class TokenDispatcherWithMC2(MoETokenDispatcher[MoEMC2CombineMetadata]):
                 "ZB SHMEM early pool is too small for the actual dispatch layout; "
                 f"early_local_mem_size={early_local_mem_size} "
                 f"required_local_mem_size={local_mem_size} hidden={hidden} "
-                f"moe_expert_num={moe_expert_num} use_quant={use_quant}.")
+                f"moe_expert_num={moe_expert_num} use_quant={use_quant}. "
+                "Increase VLLM_ASCEND_ZB_SHMEM_LOCAL_MEM_SIZE or fix early sizing.")
 
         runtime.alloc_ext_info()
         bundle = runtime.allocate_low_latency_tensors(

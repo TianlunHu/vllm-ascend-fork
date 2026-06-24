@@ -257,6 +257,11 @@ class NPUWorker(WorkerBase):
     def _init_device(self):
         device = torch.device(f"npu:{self.local_rank}")
         torch.npu.set_device(device)
+        if int(torch.npu.current_device()) != self.local_rank:
+            raise RuntimeError(
+                f"Failed to bind NPU device: requested npu:{self.local_rank} "
+                f"but current_device={torch.npu.current_device()}"
+            )
 
         # Import _inductor for graph mode execution with triton
         # This lazy import avoids torch_npu re-initialization in patch
