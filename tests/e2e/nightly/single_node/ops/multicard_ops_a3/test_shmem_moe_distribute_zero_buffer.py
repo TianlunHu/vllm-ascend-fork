@@ -44,7 +44,7 @@ Examples:
     python tests/e2e/nightly/single_node/ops/multicard_ops_a3/test_shmem_moe_distribute_zero_buffer.py
 
 Requires:
-  - package built with ``VLLM_ASCEND_ENABLE_ZB_OPS=1``
+  - package built with ``Ascend SHMEM installed at /usr/local/Ascend/shmem/latest``
   - ``VLLM_ASCEND_ZB_SHMEM_URI`` reachable across EP ranks
   - A3 with at least ``VLLM_ASCEND_MOE_MC2_TEST_WORLD_SIZE`` NPUs (default 8)
 
@@ -607,7 +607,7 @@ def _launch_multiprocess(world_size: int | None = None) -> None:
                    "shmem_moe_distribute_dispatch_zero_buffer"):
         raise AssertionError(
             "shmem_moe_distribute_dispatch_zero_buffer not registered; rebuild "
-            "vllm_ascend_C with VLLM_ASCEND_ENABLE_ZB_OPS=1")
+            "vllm_ascend_C with Ascend SHMEM installed at /usr/local/Ascend/shmem/latest")
 
     world_size = world_size or mc2_world_size()
     port = _hccl_master_port() + random.randint(0, 10000)

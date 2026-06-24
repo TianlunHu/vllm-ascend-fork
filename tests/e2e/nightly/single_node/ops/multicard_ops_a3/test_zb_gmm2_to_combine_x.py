@@ -5,7 +5,7 @@
 # SHMEM ``combine_x`` buffer so ZB combine can use ``ori_x=None`` (no
 # ``CopyValidExpandXToShmem``).
 #
-# Run on A3 (built with VLLM_ASCEND_ENABLE_ZB_OPS=1):
+# Run on A3 (built with Ascend SHMEM installed at /usr/local/Ascend/shmem/latest):
 #
 #   source /usr/local/Ascend/ascend-toolkit/set_env.sh
 #   export VLLM_ASCEND_ZB_SHMEM_URI=tcp://127.0.0.1:29556
@@ -322,11 +322,11 @@ def _worker(rank: int, world_size: int, port: int, results: mp.SimpleQueue) -> N
 def _launch(world_size: int) -> list[Gmm2CombineXResult]:
     if not hasattr(torch.ops._C_ascend, "shmem_moe_distribute_dispatch_zero_buffer"):
         raise RuntimeError(
-            "ZB ops not registered; rebuild vllm_ascend_C with VLLM_ASCEND_ENABLE_ZB_OPS=1")
+            "ZB ops not registered; rebuild vllm_ascend_C with Ascend SHMEM installed at /usr/local/Ascend/shmem/latest")
     if not hasattr(torch.ops._C_ascend, "zb_moe_grouped_matmul_gmm2_out"):
         raise RuntimeError(
             "zb_moe_grouped_matmul_gmm2_out not registered; rebuild vllm_ascend_C with "
-            "VLLM_ASCEND_ENABLE_ZB_OPS=1")
+            "Ascend SHMEM installed at /usr/local/Ascend/shmem/latest")
 
     port = mc2_hccl_port() + random.randint(0, 10000)
     mp.set_start_method("fork", force=True)

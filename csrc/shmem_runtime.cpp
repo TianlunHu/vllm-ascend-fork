@@ -78,14 +78,7 @@ int32_t fill_init_attr(int32_t rank, int32_t world_size, uint64_t local_mem_size
 
 bool zb_shmem_debug_enabled()
 {
-    const char *flag = std::getenv("VLLM_ASCEND_ZB_SHMEM_DEBUG");
-    if (flag == nullptr || flag[0] == '\0') {
-        return false;
-    }
-    if (std::strcmp(flag, "0") == 0 || std::strcmp(flag, "false") == 0 || std::strcmp(flag, "False") == 0) {
-        return false;
-    }
-    return true;
+    return false;
 }
 
 int32_t query_aclrt_device_or_neg1()

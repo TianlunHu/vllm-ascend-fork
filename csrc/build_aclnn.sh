@@ -7,6 +7,10 @@ log() {
     echo "[build_aclnn] $*"
 }
 
+shmem_available() {
+    [[ -f /usr/local/Ascend/shmem/latest/shmem/include/shmem.h ]]
+}
+
 resolve_op_dir() {
     local op_name=$1
     local candidate_dir
@@ -202,8 +206,8 @@ elif [[ "$SOC_VERSION" =~ ^ascend910_93 ]]; then
         "chunk_fwd_o"
         "chunk_gated_delta_rule_fwd_h"
     )
-    if [[ "${VLLM_ASCEND_ENABLE_ZB_OPS:-}" =~ ^(1|true|TRUE|on|ON|yes|YES)$ ]]; then
-        log "enable zero-buffer shmem MoE ops via VLLM_ASCEND_ENABLE_ZB_OPS=${VLLM_ASCEND_ENABLE_ZB_OPS}"
+    if shmem_available; then
+        log "Ascend SHMEM detected: enabling zero-buffer shmem MoE ops"
         CUSTOM_OPS_ARRAY+=(
             "shmem_moe_distribute_dispatch_zero_buffer"
             "shmem_moe_distribute_combine_zero_buffer"

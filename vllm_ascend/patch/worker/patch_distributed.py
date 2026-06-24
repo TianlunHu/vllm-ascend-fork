@@ -154,8 +154,7 @@ class GroupCoordinatorPatch(GroupCoordinator):
             assert self.cpu_group is not None
             assert self.device_group is not None
 
-            self.device = torch.device(f"npu:{local_rank}")
-            torch.npu.set_device(self.device)
+            self.device = torch.npu.current_device()
             if use_device_communicator and self.world_size > 1:
                 self.device_communicator = NPUCommunicator(
                     cpu_group=self.cpu_group,

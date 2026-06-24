@@ -112,27 +112,14 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Control the aclrtMemcpyBatchAsync compile path for KV cache offloading.
     # "1": force enable, "0": force disable, None: auto-detect from CANN headers.
     "VLLM_ASCEND_ENABLE_BATCH_MEMCPY": lambda: os.getenv("VLLM_ASCEND_ENABLE_BATCH_MEMCPY", None),
-    # Whether to build and register the SHMEM-based zero-buffer MoE distribute
-    # dispatch/combine custom ops. Off by default; set to "1"/"on"/"true" to
-    # enable. When enabled, build_aclnn.sh compiles the kernels and the C++
-    # extension registers torch.ops._C_ascend.shmem_moe_distribute_*_zero_buffer.
-    "VLLM_ASCEND_ENABLE_ZB_OPS": lambda: os.getenv("VLLM_ASCEND_ENABLE_ZB_OPS", None),
     # Runtime switch for routing TokenDispatcherWithMC2 through the SHMEM
     # zero-buffer dispatch/combine ops instead of the default
-    # torch_npu.npu_moe_distribute_*_v2 path. Requires the build to have set
-    # VLLM_ASCEND_ENABLE_ZB_OPS=1 and a reachable SHMEM control endpoint via
-    # VLLM_ASCEND_ZB_SHMEM_URI.
+    # torch_npu.npu_moe_distribute_*_v2 path. Requires Ascend SHMEM at build
+    # time and a reachable SHMEM control endpoint via VLLM_ASCEND_ZB_SHMEM_URI.
     "VLLM_ASCEND_ENABLE_ZB_SHMEM": lambda: bool(int(os.getenv("VLLM_ASCEND_ENABLE_ZB_SHMEM", "0"))),
     # SHMEM control endpoint forwarded to aclshmemx_init_attr. Format:
     # "tcp://<host>:<port>". Must be identical across all MC2/EP ranks.
     "VLLM_ASCEND_ZB_SHMEM_URI": lambda: os.getenv("VLLM_ASCEND_ZB_SHMEM_URI", ""),
-    # Extra ZB SHMEM init diagnostics (device id remap, aclrtGetDevice snapshots).
-    # Set to 1/true to enable C++ stderr logs prefixed with [ZB-SHMEM].
-    "VLLM_ASCEND_ZB_SHMEM_DEBUG": lambda: os.getenv("VLLM_ASCEND_ZB_SHMEM_DEBUG", ""),
-    # Optional override: full physical id list for all EP ranks (length DP*TP*PP*PCP).
-    # Required when card ids are not contiguous 0..N-1; same value on every worker.
-    "VLLM_ASCEND_ZB_SHMEM_MC2_VISIBLE_DEVICES": lambda: os.getenv(
-        "VLLM_ASCEND_ZB_SHMEM_MC2_VISIBLE_DEVICES", ""),
     # Whether to use MultiBlockPool for KV cache management
     "VLLM_ASCEND_APPLY_DSV4_PATCH": lambda: bool(int(os.getenv("VLLM_ASCEND_APPLY_DSV4_PATCH", "0"))),
 }

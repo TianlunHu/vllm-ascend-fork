@@ -20,7 +20,7 @@ Verifies that on a real A3 box with Ascend SHMEM available:
 
 The test is intentionally HCCL-free; SHMEM is the only inter-rank dependency.
 Requires:
-  - the package to be built with ``VLLM_ASCEND_ENABLE_ZB_OPS=1`` so the
+  - Ascend SHMEM installed at /usr/local/Ascend/shmem/latest so the
     zero-buffer ops and SHMEM runtime bindings are present.
   - a reachable SHMEM control endpoint exported via
     ``VLLM_ASCEND_ZB_SHMEM_URI`` (default ``tcp://127.0.0.1:29555``).
@@ -131,9 +131,9 @@ def _worker(rank: int, world_size: int, results) -> None:
 
 @torch.inference_mode()
 def test_zb_shmem_runtime_smoke() -> None:
-    # zb_shmem_* symbols must exist; if the build was done without
-    # VLLM_ASCEND_ENABLE_ZB_OPS the dispatch/combine ops would be missing,
-    # but the runtime bindings themselves should still be there.
+    # zb_shmem_* symbols must exist. Without Ascend SHMEM at build time the
+    # dispatch/combine ops would be missing, but the runtime bindings themselves
+    # should still be there when SHMEM is linked.
     for op_name in ("zb_shmem_init", "zb_shmem_alloc", "zb_shmem_alloc_tensor",
                     "zb_shmem_alias_tensor", "zb_shmem_finalize",
                     "zb_shmem_is_initialized"):

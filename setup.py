@@ -347,11 +347,6 @@ class cmake_build_ext(build_ext):
         if envs.VLLM_ASCEND_ENABLE_BATCH_MEMCPY is not None:
             cmake_args += [f"-DVLLM_ASCEND_ENABLE_BATCH_MEMCPY={envs.VLLM_ASCEND_ENABLE_BATCH_MEMCPY}"]
 
-        # Forward VLLM_ASCEND_ENABLE_ZB_OPS to CMake. When truthy, vllm_ascend_C
-        # registers and links the zero-buffer SHMEM MoE distribute ops.
-        if envs.VLLM_ASCEND_ENABLE_ZB_OPS is not None:
-            cmake_args += [f"-DVLLM_ASCEND_ENABLE_ZB_OPS={envs.VLLM_ASCEND_ENABLE_ZB_OPS}"]
-
         build_tool = []
         # TODO(ganyi): ninja and ccache support for ascend c auto codegen. now we can only use make build
         # if which('ninja') is not None:

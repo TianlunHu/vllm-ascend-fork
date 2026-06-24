@@ -10,18 +10,19 @@ from typing import Optional, Sequence
 
 import torch
 
-from vllm_ascend.ops.fused_moe.zb_shmem_device_env import parse_visible_devices
 from vllm_ascend.utils import enable_custom_op
 
 logger = logging.getLogger(__name__)
+
+_ZB_BUILD_HINT = (
+    "Install Ascend SHMEM at /usr/local/Ascend/shmem/latest and rebuild vllm_ascend.")
 
 # Per-rank SHMEM heap passed to aclshmemx_init_attr(local_mem_size). All subsequent
 # aclshmem_malloc / aclshmemx_calloc allocations are carved from this pool.
 DEFAULT_LOCAL_MEM_SIZE = 4 * 1024 * 1024 * 1024
 
 # Control/metadata buffer (ext_info / gva_ptr) size. Matches deepep_standalone's
-# SHMEM_META_DATA_SIZE = 1 MiB. This is NOT tensor payload; kernels only need a
-# small metainfo region, typically well under 2 MiB.
+# SHMEM_META_DATA_SIZE = 1 MiB.
 DEFAULT_EXT_INFO_BYTES = 1 * 1024 * 1024
 
 # Small fixed bookkeeping inside the SHMEM pool (see deepep_standalone fixed_bytes).
@@ -36,13 +37,6 @@ DEFAULT_COMM_ALG = "fullmesh_v1"
 
 # Process-wide runtime created by ensure_zb_shmem_process_initialized().
 _ZB_PROCESS_RUNTIME: ShmemMoERuntime | None = None
-
-
-def _env_int(name: str, default: int) -> int:
-    raw = os.getenv(name)
-    if raw is None or raw == "":
-        return default
-    return int(raw)
 
 
 def _round_up(value: int, alignment: int) -> int:
@@ -94,16 +88,8 @@ def estimate_local_mem_size(
     fixed_overhead_bytes: int | None = None,
     pool_slack_bytes: int | None = None,
 ) -> int:
-    """Estimate aclshmemx_init_attr(local_mem_size) for the ZB low-latency path.
-
-    Components:
-      - ``ext_info`` metainfo (default 1 MiB, configurable)
-      - ``combine_x`` / ``expand_x_out`` / optional ``dynamic_scales_out``
-      - small fixed bookkeeping (optional, scales with expert layout)
-      - pool slack for alignment/runtime overhead
-    """
-    ext_bytes = ext_info_bytes if ext_info_bytes is not None else _env_int(
-        "VLLM_ASCEND_ZB_EXT_INFO_BYTES", DEFAULT_EXT_INFO_BYTES)
+    """Estimate aclshmemx_init_attr(local_mem_size) for the ZB low-latency path."""
+    ext_bytes = ext_info_bytes if ext_info_bytes is not None else DEFAULT_EXT_INFO_BYTES
     if ext_bytes <= 0:
         raise ValueError("ext_info_bytes must be positive")
 
@@ -116,18 +102,13 @@ def estimate_local_mem_size(
     fixed_bytes = fixed_overhead_bytes
     if fixed_bytes is None:
         if moe_expert_num is not None and ep_world_size is not None:
-            # deepep_standalone: E * 4 + R * E * 4
             fixed_bytes = moe_expert_num * 4 + ep_world_size * moe_expert_num * 4
         else:
             fixed_bytes = DEFAULT_SHMEM_FIXED_OVERHEAD_BYTES
 
-    slack_bytes = pool_slack_bytes if pool_slack_bytes is not None else _env_int(
-        "VLLM_ASCEND_ZB_SHMEM_POOL_SLACK_BYTES", DEFAULT_SHMEM_POOL_SLACK_BYTES)
-
-    override = os.getenv("VLLM_ASCEND_ZB_SHMEM_LOCAL_MEM_SIZE")
-    if override:
-        return int(override)
-
+    slack_bytes = (
+        pool_slack_bytes if pool_slack_bytes is not None else DEFAULT_SHMEM_POOL_SLACK_BYTES
+    )
     total = ext_bytes + data_bytes + fixed_bytes + slack_bytes
     return _round_up(total, SHMEM_POOL_ALIGN_BYTES)
 
@@ -170,6 +151,19 @@ def get_zb_shmem_process_runtime() -> ShmemMoERuntime | None:
     return _ZB_PROCESS_RUNTIME
 
 
+def _ensure_custom_op_loaded() -> None:
+    if not enable_custom_op():
+        raise RuntimeError(
+            "vllm_ascend_C custom ops are not available; cannot use zero-buffer SHMEM runtime")
+
+
+def _ensure_zb_op_available(op_name: str) -> None:
+    _ensure_custom_op_loaded()
+    if not hasattr(torch.ops._C_ascend, op_name):
+        raise RuntimeError(
+            f"torch.ops._C_ascend.{op_name} is not registered. {_ZB_BUILD_HINT}")
+
+
 def ensure_zb_shmem_process_initialized(
     rank: int,
     world_size: int,
@@ -189,31 +183,22 @@ def ensure_zb_shmem_process_initialized(
             "VLLM_ASCEND_ENABLE_ZB_SHMEM=1 but VLLM_ASCEND_ZB_SHMEM_URI is unset. "
             "Set it to e.g. tcp://<host>:<port> (identical across all EP ranks).")
 
+    _ensure_zb_op_available("zb_shmem_init")
+
     runtime = ShmemMoERuntime(
         rank=rank,
         world_size=world_size,
         server_ip_port=server_ip_port,
         local_mem_size=local_mem_size,
     )
-    device_ctx = describe_zb_device_context()
-    logger.warning(
-        "[ZB-SHMEM] process init starting rank=%d world_size=%d uri=%s "
-        "local_mem_size=%.1fMiB device_ctx=%s",
-        rank,
-        world_size,
-        server_ip_port,
-        local_mem_size / (1024 * 1024),
-        device_ctx,
-    )
     runtime.init()
     _ZB_PROCESS_RUNTIME = runtime
-    logger.warning(
-        "[ZB-SHMEM] process init done rank=%d world_size=%d my_pe=%d "
-        "local_mem_size=%.1fMiB",
+    logger.info(
+        "ZB SHMEM initialized rank=%d world_size=%d local_mem_size=%.1fMiB uri=%s",
         runtime.rank,
         world_size,
-        runtime.rank,
         local_mem_size / (1024 * 1024),
+        server_ip_port,
     )
     return runtime
 
@@ -223,55 +208,6 @@ class LowLatencyShmemTensors:
     combine_x: torch.Tensor
     expand_x_out: torch.Tensor
     dynamic_scales_out: Optional[torch.Tensor]
-
-
-def _ensure_custom_op_loaded() -> None:
-    if not enable_custom_op():
-        raise RuntimeError("vllm_ascend_C custom ops are not available; cannot use zero-buffer SHMEM runtime")
-
-
-def _ensure_zb_op_available(op_name: str) -> None:
-    _ensure_custom_op_loaded()
-    if not hasattr(torch.ops._C_ascend, op_name):
-        raise RuntimeError(
-            f"torch.ops._C_ascend.{op_name} is not registered. Rebuild vllm_ascend_C with "
-            "VLLM_ASCEND_ENABLE_ZB_OPS=1 to enable zero-buffer SHMEM MoE distribute ops.")
-
-
-def _zb_shmem_debug_enabled() -> bool:
-    raw = os.getenv("VLLM_ASCEND_ZB_SHMEM_DEBUG", "")
-    return raw not in ("", "0", "false", "False")
-
-
-def describe_zb_device_context() -> dict[str, object]:
-    """Summarize NPU device ids for aclshmem/HyBM init diagnostics."""
-    visible_devices = parse_visible_devices()
-    logical_device_id = int(torch.npu.current_device())
-    visible_raw = os.getenv("ASCEND_RT_VISIBLE_DEVICES", "")
-    needs_remap = (
-        bool(visible_devices)
-        and 0 <= logical_device_id < len(visible_devices)
-        and visible_devices[logical_device_id] != logical_device_id
-    )
-    physical_device_id = (
-        visible_devices[logical_device_id]
-        if needs_remap
-        else logical_device_id
-    )
-    return {
-        "logical_device_id": logical_device_id,
-        "physical_device_id": physical_device_id,
-        "visible_devices": visible_devices,
-        "ascend_rt_visible_devices": visible_raw,
-        "needs_device_remap": needs_remap,
-        "dp1_passthrough": not needs_remap,
-    }
-
-
-def get_zb_physical_device_id() -> int:
-    """Return global user NPU id; equals ``torch.npu.current_device()`` when visible is identity-mapped."""
-    ctx = describe_zb_device_context()
-    return int(ctx["physical_device_id"])
 
 
 @dataclass
@@ -287,18 +223,7 @@ class ShmemMoERuntime:
             self.server_ip_port = os.getenv("VLLM_ASCEND_ZB_SHMEM_URI", "")
 
     def init(self) -> int:
-        _ensure_custom_op_loaded()
-        device_ctx = describe_zb_device_context()
-        if _zb_shmem_debug_enabled():
-            logger.warning(
-                "[ZB-SHMEM] zb_shmem_init request rank=%d world_size=%d device_ctx=%s "
-                "local_mem_size=%d uri=%s",
-                self.rank,
-                self.world_size,
-                device_ctx,
-                self.local_mem_size,
-                self.server_ip_port,
-            )
+        _ensure_zb_op_available("zb_shmem_init")
         actual_rank = torch.ops._C_ascend.zb_shmem_init(
             self.rank,
             self.world_size,
@@ -306,12 +231,6 @@ class ShmemMoERuntime:
             self.server_ip_port,
         )
         self.rank = int(actual_rank)
-        logger.warning(
-            "[ZB-SHMEM] zb_shmem_init done rank=%d world_size=%d my_pe=%d",
-            self.rank,
-            self.world_size,
-            self.rank,
-        )
         return self.rank
 
     def alloc(self, element_count: int, element_size: int = 1) -> int:
@@ -320,13 +239,7 @@ class ShmemMoERuntime:
         return self.ext_info
 
     def alloc_ext_info(self, nbytes: int | None = None) -> int:
-        """Allocate the ZB metainfo/control buffer (``ext_info`` / ``gva_ptr``).
-
-        deepep_standalone uses ``SHMEM_META_DATA_SIZE = 1 MiB`` via
-        ``aclshmemx_calloc(SHMEM_META_DATA_SIZE / 4, 4)``.
-        """
-        raw_bytes = nbytes if nbytes is not None else _env_int(
-            "VLLM_ASCEND_ZB_EXT_INFO_BYTES", DEFAULT_EXT_INFO_BYTES)
+        raw_bytes = nbytes if nbytes is not None else DEFAULT_EXT_INFO_BYTES
         if raw_bytes <= 0:
             raise ValueError("ext_info nbytes must be positive")
         if raw_bytes % 4 != 0:
@@ -339,17 +252,10 @@ class ShmemMoERuntime:
         dtype: torch.dtype,
         device: torch.device | str,
     ) -> torch.Tensor:
-        """Allocate a SHMEM-backed NPU tensor.
-
-        Tensor data buffers are independent from ``ext_info``. The latter is
-        the metadata/control buffer allocated by :meth:`alloc` and passed to
-        zero-buffer kernels.
-        """
         _ensure_custom_op_loaded()
         return torch.ops._C_ascend.zb_shmem_alloc_tensor(list(shape), dtype, str(device))
 
     def alias_tensor(self, base: torch.Tensor, shape: Sequence[int], dtype: torch.dtype) -> torch.Tensor:
-        """Create a tensor view with a different dtype over a SHMEM tensor buffer."""
         _ensure_custom_op_loaded()
         return torch.ops._C_ascend.zb_shmem_alias_tensor(base, list(shape), dtype)
 
@@ -361,13 +267,6 @@ class ShmemMoERuntime:
         *,
         use_quant: bool = False,
     ) -> LowLatencyShmemTensors:
-        """Allocate the SHMEM tensors required by the zero-buffer low-latency path.
-
-        This mirrors deepep_standalone's ``preallocate_lowlatency_shmem_tensors``:
-        ``combine_x`` is always BF16; ``expand_x_out`` aliases it as INT8 when
-        quantization is enabled, otherwise it owns a separate BF16 SHMEM buffer.
-        ``dynamic_scales_out`` exists only for the quantized path.
-        """
         combine_x = self.alloc_tensor([max_recv_tokens, hidden_size], torch.bfloat16, device)
         if use_quant:
             expand_x_out = self.alias_tensor(combine_x, [max_recv_tokens, hidden_size], torch.int8)
@@ -441,12 +340,6 @@ def shmem_moe_distribute_dispatch_zero_buffer(
     copy_expert_num: int = 0,
     const_expert_num: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Thin Python wrapper around torch.ops._C_ascend.shmem_moe_distribute_dispatch_zero_buffer.
-
-    All output tensors must be pre-allocated by the caller. ``ext_info`` is the
-    SHMEM global virtual address returned by :py:meth:`ShmemMoERuntime.alloc` /
-    :py:meth:`ShmemMoERuntime.get_ext_info`.
-    """
     _ensure_zb_op_available("shmem_moe_distribute_dispatch_zero_buffer")
     return torch.ops._C_ascend.shmem_moe_distribute_dispatch_zero_buffer(
         x,
@@ -517,17 +410,8 @@ def shmem_moe_distribute_combine_zero_buffer(
     copy_expert_num: int = 0,
     const_expert_num: int = 0,
 ) -> torch.Tensor:
-    """Thin Python wrapper around torch.ops._C_ascend.shmem_moe_distribute_combine_zero_buffer.
-
-    ``combined_x`` must be pre-allocated by the caller. ``ext_info`` is the
-    SHMEM global virtual address used as the combine source buffer pointer
-    (typically the same value used by ``shmem_moe_distribute_dispatch_zero_buffer``).
-    """
     _ensure_zb_op_available("shmem_moe_distribute_combine_zero_buffer")
     if tp_send_count is None:
-        # The combine tiling marks tp_send_count optional, but still validates
-        # its shape and dtype. deepep_standalone always passes an int32 tensor
-        # with one entry per TP rank even when tp_world_size == 1.
         tp_send_count = torch.empty((tp_world_size,), dtype=torch.int32, device=expand_x.device)
     return torch.ops._C_ascend.shmem_moe_distribute_combine_zero_buffer(
         expand_x,

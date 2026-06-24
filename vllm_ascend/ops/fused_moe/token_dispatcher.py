@@ -55,108 +55,6 @@ from vllm_ascend.utils import (
 EXPERT_TOKEN_NUMS_TYPE_CUMSUM = 0
 EXPERT_TOKEN_NUMS_TYPE_COUNT = 1
 
-# Process-wide ZB graph diagnostics (ep_rank 0 only, gated by debug env).
-_ZB_GRAPH_DIAG_TOTALS: dict[str, int] = {"dispatch": 0, "combine": 0}
-_ZB_GRAPH_DIAG_HINT_EMITTED = False
-
-
-def _zb_graph_debug_enabled() -> bool:
-    raw = envs_ascend.VLLM_ASCEND_ZB_SHMEM_DEBUG
-    return raw not in ("", "0", "false", "False")
-
-
-def _zb_graph_diag_fields() -> tuple[bool, bool, str, object | None]:
-    """Return stream_capturing, forward_context.capturing, cudagraph_mode, batch_tokens."""
-    stream_capturing = torch.npu.is_current_stream_capturing()
-    fc_capturing = False
-    cudagraph_mode = "NONE"
-    batch_tokens = None
-    try:
-        from vllm.forward_context import get_forward_context
-
-        fwd_ctx = get_forward_context()
-        fc_capturing = bool(getattr(fwd_ctx, "capturing", False))
-        mode = getattr(fwd_ctx, "cudagraph_runtime_mode", None)
-        if mode is not None:
-            cudagraph_mode = getattr(mode, "name", str(mode))
-        batch_desc = getattr(fwd_ctx, "batch_descriptor", None)
-        if batch_desc is not None:
-            batch_tokens = getattr(batch_desc, "num_tokens", None)
-    except Exception:
-        pass
-    return stream_capturing, fc_capturing, cudagraph_mode, batch_tokens
-
-
-def _should_emit_zb_graph_log(total: int) -> bool:
-    return total <= 10 or total in (50, 100, 500, 1000) or total % 1000 == 0
-
-
-def _log_zb_graph_hint(ep_rank_id: int) -> None:
-    global _ZB_GRAPH_DIAG_HINT_EMITTED
-    if _ZB_GRAPH_DIAG_HINT_EMITTED or ep_rank_id != 0 or not _zb_graph_debug_enabled():
-        return
-    _ZB_GRAPH_DIAG_HINT_EMITTED = True
-    logger.warning(
-        "[ZB-GRAPH] diagnose: compare total dispatch/combine counters before vs after "
-        "a decode-heavy request on ep_rank=0. If totals keep growing during decode, "
-        "ZB is running outside ACLGraph replay (not in graph). If totals only move "
-        "during startup/prefill and stay flat during decode, ZB is likely in graph. "
-        "stream_capturing=True during startup means the op was recorded into NPUGraph."
-    )
-
-
-def _log_zb_graph_op(
-    phase: str,
-    *,
-    ep_rank_id: int,
-    local_call: int,
-    detail: str = "",
-) -> None:
-    global _ZB_GRAPH_DIAG_TOTALS
-    _log_zb_graph_hint(ep_rank_id)
-
-    _ZB_GRAPH_DIAG_TOTALS[phase] += 1
-    total = _ZB_GRAPH_DIAG_TOTALS[phase]
-
-    stream_capturing, fc_capturing, cudagraph_mode, batch_tokens = _zb_graph_diag_fields()
-    in_graph_capture = stream_capturing or fc_capturing
-
-    if _zb_graph_debug_enabled():
-        if ep_rank_id != 0 or not _should_emit_zb_graph_log(total):
-            return
-        logger.warning(
-            "[ZB-GRAPH] %s total=%d local=#%d ep_rank=%d "
-            "stream_capturing=%s fc_capturing=%s in_graph_capture=%s "
-            "cudagraph_mode=%s batch_tokens=%s%s",
-            phase,
-            total,
-            local_call,
-            ep_rank_id,
-            stream_capturing,
-            fc_capturing,
-            in_graph_capture,
-            cudagraph_mode,
-            batch_tokens,
-            f" {detail}" if detail else "",
-        )
-        return
-
-    if not TokenDispatcherWithMC2._should_log_zb_call(local_call):
-        return
-    logger.warning(
-        "[ZB-SHMEM] %s local=#%d ep_rank=%d total=%d "
-        "stream_capturing=%s fc_capturing=%s cudagraph_mode=%s batch_tokens=%s%s",
-        phase,
-        local_call,
-        ep_rank_id,
-        total,
-        stream_capturing,
-        fc_capturing,
-        cudagraph_mode,
-        batch_tokens,
-        f" {detail}" if detail else "",
-    )
-
 
 def _get_expert_token_nums_type(token_dispatch_input: MoETokenDispatchInput) -> int:
     # grouped_matmul_swiglu_quant_v2 consumes per-expert counts; existing
@@ -258,24 +156,10 @@ class TokenDispatcherWithMC2(MoETokenDispatcher[MoEMC2CombineMetadata]):
             )
 
         self._zb_shmem_enabled = bool(envs_ascend.VLLM_ASCEND_ENABLE_ZB_SHMEM)
+        self._moe_config = moe_config
         if self._zb_shmem_enabled:
             self._validate_zb_shmem_compat()
-            self._moe_config = moe_config
             self._ensure_zb_runtime_init()
-            logger.info(
-                "TokenDispatcherWithMC2: ZB SHMEM dispatch enabled "
-                "(ep_world_size=%d, ep_rank_id=%d). aclshmem initialized at "
-                "dispatcher construction; tensor pool allocated on first "
-                "token_dispatch.",
-                self.ep_world_size,
-                self.ep_rank_id,
-            )
-        else:
-            self._moe_config = moe_config
-            logger.info(
-                "TokenDispatcherWithMC2: ZB SHMEM dispatch disabled "
-                "(VLLM_ASCEND_ENABLE_ZB_SHMEM=0); using torch_npu.npu_moe_distribute_*_v2 path."
-            )
         # SHMEM process runtime is process-wide; per-dispatcher tensor/aux buffers
         # are populated lazily on first token_dispatch.
         self._zb_runtime = None
@@ -287,10 +171,6 @@ class TokenDispatcherWithMC2(MoETokenDispatcher[MoEMC2CombineMetadata]):
         self._zb_moe_expert_num = None
         self._zb_use_quant = None
         self._zb_dispatch_quant_mode = None
-        # Temporary diagnostics for validating the serving path. Remove before
-        # merging once the SHMEM ZB path is verified end-to-end.
-        self._zb_dispatch_calls = 0
-        self._zb_combine_calls = 0
         self.moe_expert_num = 0
 
     def _validate_zb_shmem_compat(self) -> None:
@@ -308,12 +188,8 @@ class TokenDispatcherWithMC2(MoETokenDispatcher[MoEMC2CombineMetadata]):
         if (ascend_ops is None
                 or not hasattr(ascend_ops, "shmem_moe_distribute_dispatch_zero_buffer")):
             raise RuntimeError(
-                "VLLM_ASCEND_ENABLE_ZB_SHMEM=1 but zero-buffer ops are not registered; "
-                "rebuild vllm_ascend_C with VLLM_ASCEND_ENABLE_ZB_OPS=1.")
-
-    @staticmethod
-    def _should_log_zb_call(count: int) -> bool:
-        return count <= 3 or count in (10, 100, 1000)
+                "VLLM_ASCEND_ENABLE_ZB_SHMEM=1 but zero-buffer ops are not registered. "
+                "Install Ascend SHMEM at /usr/local/Ascend/shmem/latest and rebuild vllm_ascend.")
 
     def _resolve_zb_moe_expert_num(self) -> int:
         moe_expert_num = 0
@@ -387,7 +263,6 @@ class TokenDispatcherWithMC2(MoETokenDispatcher[MoEMC2CombineMetadata]):
 
         from vllm_ascend.ops.fused_moe.shmem_runtime import (
             compute_low_latency_max_recv_tokens,
-            describe_zb_device_context,
             estimate_local_mem_size,
             get_zb_shmem_process_runtime,
         )
@@ -426,25 +301,8 @@ class TokenDispatcherWithMC2(MoETokenDispatcher[MoEMC2CombineMetadata]):
                 "ZB SHMEM early pool is too small for the actual dispatch layout; "
                 f"early_local_mem_size={early_local_mem_size} "
                 f"required_local_mem_size={local_mem_size} hidden={hidden} "
-                f"moe_expert_num={moe_expert_num} use_quant={use_quant}. "
-                "Increase VLLM_ASCEND_ZB_SHMEM_LOCAL_MEM_SIZE or fix early sizing.")
+                f"moe_expert_num={moe_expert_num} use_quant={use_quant}.")
 
-        device_ctx = describe_zb_device_context()
-        logger.warning(
-            "[ZB-SHMEM] buffer alloc starting ep_rank=%d ep_world_size=%d "
-            "hidden=%d moe_expert_num=%d use_quant=%s max_recv_tokens=%d "
-            "required_local_mem_size=%.1fMiB early_local_mem_size=%s device_ctx=%s",
-            self.ep_rank_id,
-            self.ep_world_size,
-            hidden,
-            moe_expert_num,
-            use_quant,
-            max_recv_tokens,
-            local_mem_size / (1024 * 1024),
-            (f"{early_local_mem_size / (1024 * 1024):.1f}MiB"
-             if early_local_mem_size is not None else "unknown"),
-            device_ctx,
-        )
         runtime.alloc_ext_info()
         bundle = runtime.allocate_low_latency_tensors(
             max_recv_tokens=max_recv_tokens,
@@ -478,21 +336,6 @@ class TokenDispatcherWithMC2(MoETokenDispatcher[MoEMC2CombineMetadata]):
         self._zb_max_recv_tokens = max_recv_tokens
         self._zb_moe_expert_num = moe_expert_num
         self._zb_use_quant = use_quant
-
-        logger.warning(
-            "[ZB-SHMEM] buffer alloc done ep_rank=%d ep_world_size=%d hidden=%d "
-            "moe_expert_num=%d use_quant=%s max_recv_tokens=%d "
-            "required_local_mem_size=%.1fMiB ext_info=%d device_ctx=%s",
-            self.ep_rank_id,
-            self.ep_world_size,
-            hidden,
-            moe_expert_num,
-            use_quant,
-            max_recv_tokens,
-            local_mem_size / (1024 * 1024),
-            int(runtime.ext_info),
-            device_ctx,
-        )
 
     def _ensure_zb_initialized(
         self,
@@ -629,19 +472,6 @@ class TokenDispatcherWithMC2(MoETokenDispatcher[MoEMC2CombineMetadata]):
         bundle = self._zb_bundle
         aux = self._zb_aux
         runtime = self._zb_runtime
-
-        self._zb_dispatch_calls += 1
-        _log_zb_graph_op(
-            "dispatch",
-            ep_rank_id=self.ep_rank_id,
-            local_call=self._zb_dispatch_calls,
-            detail=(
-                f"x_shape={tuple(hidden_states.shape)} "
-                f"expert_ids_shape={tuple(topk_ids.shape)} "
-                f"quant_mode={quant_mode} global_bs={self.global_bs} "
-                f"moe_expert_num={moe_expert_num}"
-            ),
-        )
 
         shmem_moe_distribute_dispatch_zero_buffer(
             x=hidden_states,
@@ -836,17 +666,6 @@ class TokenDispatcherWithMC2(MoETokenDispatcher[MoEMC2CombineMetadata]):
             (num_combined_tokens, hidden_states.shape[-1]),
             dtype=torch.bfloat16,
             device=hidden_states.device,
-        )
-
-        self._zb_combine_calls += 1
-        _log_zb_graph_op(
-            "combine",
-            ep_rank_id=self.ep_rank_id,
-            local_call=self._zb_combine_calls,
-            detail=(
-                f"gmm_rows={num_expert_rows} combined_x_shape={tuple(combined_x.shape)} "
-                f"comm_quant_mode={comm_quant_mode} global_bs={self.global_bs}"
-            ),
         )
 
         shmem_moe_distribute_combine_zero_buffer(

@@ -124,7 +124,9 @@ pybind11_add_module(vllm_ascend_C ${VLLM_ASCEND_SRC})
 
 if(VLLM_ASCEND_SHMEM_LIBS)
   target_compile_definitions(vllm_ascend_C PRIVATE VLLM_ASCEND_ENABLE_SHMEM_RUNTIME)
+  target_compile_definitions(vllm_ascend_C PRIVATE VLLM_ASCEND_ENABLE_ZB_OPS)
   target_include_directories(vllm_ascend_C PRIVATE ${SHMEM_HOME_PATH}/shmem/include)
+  message(STATUS "Ascend SHMEM detected: enabling zero-buffer MoE distribute ops")
 endif()
 
 # Detect aclrtMemcpyBatchAsync availability (CANN 8.5+)
@@ -176,18 +178,6 @@ endif()
 if(NOT (SOC_VERSION MATCHES "ascend310p.*|ascend950"))
     target_compile_definitions(vllm_ascend_C PRIVATE -DVLLM_ENABLE_ATB_AND_DIRECT_KERNELS)
 endif()
-
-# Zero-buffer SHMEM MoE distribute ops are opt-in via VLLM_ASCEND_ENABLE_ZB_OPS.
-# Accept the same truthy spellings used by build_aclnn.sh and turn them into a
-# private compile definition consumed by torch_binding.cpp / torch_binding_meta.cpp.
-set(_zb_ops_value "${VLLM_ASCEND_ENABLE_ZB_OPS}")
-string(TOLOWER "${_zb_ops_value}" _zb_ops_value_lower)
-if(_zb_ops_value_lower MATCHES "^(1|true|on|yes)$")
-    message(STATUS "VLLM_ASCEND_ENABLE_ZB_OPS=${VLLM_ASCEND_ENABLE_ZB_OPS}: registering zero-buffer SHMEM MoE distribute ops")
-    target_compile_definitions(vllm_ascend_C PRIVATE -DVLLM_ASCEND_ENABLE_ZB_OPS)
-endif()
-unset(_zb_ops_value)
-unset(_zb_ops_value_lower)
 
 target_link_directories(
   vllm_ascend_C

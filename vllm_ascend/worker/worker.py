@@ -255,51 +255,8 @@ class NPUWorker(WorkerBase):
         self.cache_config.num_cpu_blocks = num_cpu_blocks
 
     def _init_device(self):
-        from vllm_ascend.ops.fused_moe.zb_shmem_device_env import (
-            compute_mc2_device_rank,
-            describe_mc2_device_bind,
-            is_mc2_full_visible_env,
-            should_use_zb_mc2_full_visible,
-            validate_mc2_device_rank,
-        )
-
-        if should_use_zb_mc2_full_visible(self.vllm_config) and not is_mc2_full_visible_env(
-            self.vllm_config
-        ):
-            from vllm_ascend.ops.fused_moe.zb_shmem_device_env import resolve_mc2_visible_devices
-
-            raise RuntimeError(
-                "[ZB-SHMEM] ASCEND_RT_VISIBLE_DEVICES was not expanded to the full MC2 "
-                f"list before CANN init (current={os.getenv('ASCEND_RT_VISIBLE_DEVICES', '')!r}, "
-                f"expected={resolve_mc2_visible_devices(self.vllm_config)!r}). Ensure worker "
-                "spawn uses ascend_worker_main (patch_zb_shmem loaded in this process)."
-            )
-
-        partition_local_rank = self.local_rank
-        device_rank = compute_mc2_device_rank(self.vllm_config, partition_local_rank)
-        validate_mc2_device_rank(self.vllm_config, device_rank)
-        if should_use_zb_mc2_full_visible(self.vllm_config):
-            bind_ctx = describe_mc2_device_bind(self.vllm_config, partition_local_rank)
-            logger.warning(
-                "[ZB-SHMEM] worker device bind %s",
-                bind_ctx,
-            )
-        if device_rank != partition_local_rank:
-            logger.warning(
-                "[ZB-SHMEM] adjusting worker device rank local_rank=%d -> device_rank=%d "
-                "for MC2 full visible list ASCEND_RT_VISIBLE_DEVICES=%r",
-                partition_local_rank,
-                device_rank,
-                os.getenv("ASCEND_RT_VISIBLE_DEVICES", ""),
-            )
-            self.local_rank = device_rank
         device = torch.device(f"npu:{self.local_rank}")
         torch.npu.set_device(device)
-        if int(torch.npu.current_device()) != self.local_rank:
-            raise RuntimeError(
-                f"[ZB-SHMEM] failed to bind NPU device: requested npu:{self.local_rank} "
-                f"but current_device={torch.npu.current_device()}"
-            )
 
         # Import _inductor for graph mode execution with triton
         # This lazy import avoids torch_npu re-initialization in patch
@@ -344,14 +301,6 @@ class NPUWorker(WorkerBase):
 
         # Initialize the distributed environment.
         self._init_worker_distributed_environment()
-        # HCCL process-group creation can reset the current NPU device to 0.
-        # Re-bind before model load / profiling so tensors stay on `device`.
-        torch.npu.set_device(device)
-        if int(torch.npu.current_device()) != device.index:
-            raise RuntimeError(
-                f"[ZB-SHMEM] NPU device drift after distributed init: "
-                f"expected npu:{device.index}, current={torch.npu.current_device()}"
-            )
         # Set random seed.
         set_random_seed(self.model_config.seed)
         # Initialize device properties used by triton kernels.
@@ -385,7 +334,6 @@ class NPUWorker(WorkerBase):
         Then, it calculates the free memory that can be used for KV cache in
         bytes.
         """
-        torch.npu.set_device(self.device)
         GiB = lambda b: b / GiB_bytes
 
         # Fast path: user has explicitly specified KV cache size via
