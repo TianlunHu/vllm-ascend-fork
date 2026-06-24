@@ -116,10 +116,12 @@ env_variables: dict[str, Callable[[], Any]] = {
     # zero-buffer dispatch/combine ops instead of the default
     # torch_npu.npu_moe_distribute_*_v2 path. Requires Ascend SHMEM at build
     # time and a reachable SHMEM control endpoint via VLLM_ASCEND_ZB_SHMEM_URI.
-    "VLLM_ASCEND_ENABLE_ZB_SHMEM": lambda: bool(int(os.getenv("VLLM_ASCEND_ENABLE_ZB_SHMEM", "0"))),
-    # SHMEM control endpoint forwarded to aclshmemx_init_attr. Format:
-    # "tcp://<host>:<port>". Must be identical across all MC2/EP ranks.
-    "VLLM_ASCEND_ZB_SHMEM_URI": lambda: os.getenv("VLLM_ASCEND_ZB_SHMEM_URI", ""),
+    "VLLM_ASCEND_ENABLE_ZB": lambda: bool(int(os.getenv(
+        "VLLM_ASCEND_ENABLE_ZB", os.getenv("VLLM_ASCEND_ENABLE_ZB_SHMEM", "0")))),
+    # SHMEM control endpoint URI forwarded to aclshmemx_init_attr (e.g. tcp://host:port).
+    # Must be identical across all MC2/EP ranks.
+    "VLLM_ASCEND_ZB_SHMEM_URI": lambda: os.getenv(
+        "VLLM_ASCEND_ZB_SHMEM_URI", os.getenv("VLLM_ASCEND_ZB_URI", "")),
     # Whether to use MultiBlockPool for KV cache management
     "VLLM_ASCEND_APPLY_DSV4_PATCH": lambda: bool(int(os.getenv("VLLM_ASCEND_APPLY_DSV4_PATCH", "0"))),
 }

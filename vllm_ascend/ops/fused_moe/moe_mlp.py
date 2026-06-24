@@ -104,7 +104,7 @@ def _apply_gmm2(
     fallback_output_dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
     if gmm2_out is not None:
-        from vllm_ascend.ops.fused_moe.shmem_runtime import zb_moe_grouped_matmul_gmm2_out
+        from vllm_ascend.ops.fused_moe.zb_runtime import zb_moe_grouped_matmul_gmm2_out
 
         if use_mxfp_quant:
             raise RuntimeError("ZB gmm2 direct-to-combine_x does not support MXFP yet.")
@@ -453,7 +453,7 @@ def unquant_apply_mlp(
         gate_up_out *= topk_scales
 
     if gmm2_out is not None:
-        from vllm_ascend.ops.fused_moe.shmem_runtime import zb_moe_grouped_matmul_gmm2_out
+        from vllm_ascend.ops.fused_moe.zb_runtime import zb_moe_grouped_matmul_gmm2_out
 
         hidden_states = zb_moe_grouped_matmul_gmm2_out(
             gate_up_out,

@@ -39,15 +39,15 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 import torch_npu
 
-from vllm_ascend.ops.fused_moe.shmem_runtime import (
-    shmem_moe_distribute_combine_zero_buffer,
-    shmem_moe_distribute_dispatch_zero_buffer,
+from vllm_ascend.ops.fused_moe.zb_runtime import (
+    zb_moe_distribute_combine_zero_buffer,
+    zb_moe_distribute_dispatch_zero_buffer,
     zb_moe_grouped_matmul_gmm2_out,
 )
 from vllm_ascend.utils import enable_custom_op
 
 from moe_mc2_e2e_common import mc2_hccl_port, mc2_shape_config, mc2_world_size
-from test_shmem_moe_distribute_zero_buffer import (
+from test_zb_moe_distribute_zero_buffer import (
     ZbMoeOpContext,
     _build_context as _build_zb_context_base,
 )
@@ -132,7 +132,7 @@ def _run_minimal_gmm2(
 
 
 def _run_zb_dispatch(ctx: ZbMoeOpContext) -> None:
-    shmem_moe_distribute_dispatch_zero_buffer(
+    zb_moe_distribute_dispatch_zero_buffer(
         x=ctx.x,
         expert_ids=ctx.topk_idx,
         expand_x_out=ctx.bundle.expand_x_out,
@@ -155,7 +155,7 @@ def _run_zb_combine(
     *,
     ori_x: torch.Tensor | None,
 ) -> None:
-    shmem_moe_distribute_combine_zero_buffer(
+    zb_moe_distribute_combine_zero_buffer(
         expand_x=ctx.bundle.combine_x,
         expert_ids=ctx.topk_idx,
         assist_info_for_combine=ctx.aux["assist_info_for_combine"],
@@ -320,7 +320,7 @@ def _worker(rank: int, world_size: int, port: int, results: mp.SimpleQueue) -> N
 
 
 def _launch(world_size: int) -> list[Gmm2CombineXResult]:
-    if not hasattr(torch.ops._C_ascend, "shmem_moe_distribute_dispatch_zero_buffer"):
+    if not hasattr(torch.ops._C_ascend, "zb_moe_distribute_dispatch_zero_buffer"):
         raise RuntimeError(
             "ZB ops not registered; rebuild vllm_ascend_C with Ascend SHMEM installed at /usr/local/Ascend/shmem/latest")
     if not hasattr(torch.ops._C_ascend, "zb_moe_grouped_matmul_gmm2_out"):

@@ -15,7 +15,7 @@
 # limitations under the License.
 """PTA MC2 baseline: ``npu_moe_distribute_dispatch_v2`` / ``combine_v2`` e2e tests.
 
-Mirrors ``test_shmem_moe_distribute_zero_buffer.py`` but exercises only the CANN PTA
+Mirrors ``test_zb_moe_distribute_zero_buffer.py`` but exercises only the CANN PTA
 path used in vLLM serving baseline (no SHMEM / no ZB ops).
 
 Use the same shape env vars as the ZB test for apples-to-apples comparison:

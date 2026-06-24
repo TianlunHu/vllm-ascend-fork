@@ -112,7 +112,7 @@ if [[ "${MODE}" == "profile" ]]; then
   echo "  Compare three serving paths with same shapes:"
   echo "    ./run_fused_mc2_baseline_test.sh profile  # this test"
   echo "    ./run_moe_distribute_v2_baseline_test.sh profile"
-  echo "    ./run_shmem_moe_zb_test.sh profile"
+  echo "    ./run_zb_moe_distribute_test.sh profile"
   echo "  Inspect ASCEND_PROFILER_OUTPUT/trace_view.json in MindStudio Insight."
 elif [[ "${MODE}" == "bench" ]]; then
   echo ""

@@ -88,7 +88,7 @@ if [[ "${MODE}" == "profile" ]]; then
   echo "  directory: ${TRACE_DIR}/pta_v2/"
   find "${TRACE_DIR}" -name '*_ascend_pt' -type d 2>/dev/null | head -20 || true
   echo ""
-  echo "  Compare with ZB: run run_shmem_moe_zb_test.sh profile with same shapes."
+  echo "  Compare with ZB: run run_zb_moe_distribute_test.sh profile with same shapes."
   echo "  Inspect ASCEND_PROFILER_OUTPUT/trace_view.json in MindStudio Insight."
 elif [[ "${MODE}" == "bench" ]]; then
   echo ""

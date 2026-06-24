@@ -27,7 +27,7 @@
 #include "torch_npu/csrc/core/npu/NPUGuard.h"
 #include <torch_npu/csrc/npu/Module.h>
 #include "ops.h"
-#include "shmem_runtime.h"
+#include "zb_runtime.h"
 #include "utils.h"
 #include "aclnn_torch_adapter/op_api_common.h"
 #include "moe/add_rms_norm_bias/add_rms_norm_bias_torch_adpt.h"
@@ -45,8 +45,8 @@
 #include "mc2/matmul_allreduce_add_rmsnorm/matmul_allreduce_add_rmsnorm_torch_adpt.h"
 #include "mc2/moe_combine_normal/moe_combine_normal_torch_adpt.h"
 #ifdef VLLM_ASCEND_ENABLE_ZB_OPS
-#include "mc2/shmem_moe_distribute_dispatch_zero_buffer/shmem_moe_distribute_dispatch_zero_buffer_torch_adpt.h"
-#include "mc2/shmem_moe_distribute_combine_zero_buffer/shmem_moe_distribute_combine_zero_buffer_torch_adpt.h"
+#include "mc2/zb_moe_distribute_dispatch_zero_buffer/zb_moe_distribute_dispatch_zero_buffer_torch_adpt.h"
+#include "mc2/zb_moe_distribute_combine_zero_buffer/zb_moe_distribute_combine_zero_buffer_torch_adpt.h"
 #include "mc2/zb_moe_grouped_matmul_gmm2_out/zb_moe_grouped_matmul_gmm2_out_torch_adpt.h"
 #endif
 #include "moe/moe_gating_top_k/moe_gating_top_k_torch_adpt.h"
@@ -2385,41 +2385,41 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
              static_cast<void (*)(const at::Tensor&)>(&vllm_ascend::device_print));
 
     ops.def(
-        "zb_shmem_init(int rank, int world_size, int local_mem_size, str server_ip_port) -> int");
-    ops.impl("zb_shmem_init", c10::DispatchKey::CompositeExplicitAutograd,
-             &vllm_ascend::zb_shmem_init);
+        "zb_init(int rank, int world_size, int local_mem_size, str server_ip_port) -> int");
+    ops.impl("zb_init", c10::DispatchKey::CompositeExplicitAutograd,
+             &vllm_ascend::zb_init);
 
-    ops.def("zb_shmem_alloc(int element_count, int element_size) -> int");
-    ops.impl("zb_shmem_alloc", c10::DispatchKey::CompositeExplicitAutograd,
-             &vllm_ascend::zb_shmem_alloc);
+    ops.def("zb_alloc(int element_count, int element_size) -> int");
+    ops.impl("zb_alloc", c10::DispatchKey::CompositeExplicitAutograd,
+             &vllm_ascend::zb_alloc);
 
-    ops.def("zb_shmem_alloc_tensor(int[] shape, ScalarType dtype, str device) -> Tensor");
-    ops.impl("zb_shmem_alloc_tensor", c10::DispatchKey::CompositeExplicitAutograd,
-             &vllm_ascend::zb_shmem_alloc_tensor);
+    ops.def("zb_alloc_tensor(int[] shape, ScalarType dtype, str device) -> Tensor");
+    ops.impl("zb_alloc_tensor", c10::DispatchKey::CompositeExplicitAutograd,
+             &vllm_ascend::zb_alloc_tensor);
 
-    ops.def("zb_shmem_alias_tensor(Tensor base, int[] shape, ScalarType dtype) -> Tensor");
-    ops.impl("zb_shmem_alias_tensor", c10::DispatchKey::CompositeExplicitAutograd,
-             &vllm_ascend::zb_shmem_alias_tensor);
+    ops.def("zb_alias_tensor(Tensor base, int[] shape, ScalarType dtype) -> Tensor");
+    ops.impl("zb_alias_tensor", c10::DispatchKey::CompositeExplicitAutograd,
+             &vllm_ascend::zb_alias_tensor);
 
-    ops.def("zb_shmem_free(int ptr) -> ()");
-    ops.impl("zb_shmem_free", c10::DispatchKey::CompositeExplicitAutograd,
-             &vllm_ascend::zb_shmem_free);
+    ops.def("zb_free(int ptr) -> ()");
+    ops.impl("zb_free", c10::DispatchKey::CompositeExplicitAutograd,
+             &vllm_ascend::zb_free);
 
-    ops.def("zb_shmem_finalize() -> ()");
-    ops.impl("zb_shmem_finalize", c10::DispatchKey::CompositeExplicitAutograd,
-             &vllm_ascend::zb_shmem_finalize);
+    ops.def("zb_finalize() -> ()");
+    ops.impl("zb_finalize", c10::DispatchKey::CompositeExplicitAutograd,
+             &vllm_ascend::zb_finalize);
 
-    ops.def("zb_shmem_get_ext_info() -> int");
-    ops.impl("zb_shmem_get_ext_info", c10::DispatchKey::CompositeExplicitAutograd,
-             &vllm_ascend::zb_shmem_get_ext_info);
+    ops.def("zb_get_ext_info() -> int");
+    ops.impl("zb_get_ext_info", c10::DispatchKey::CompositeExplicitAutograd,
+             &vllm_ascend::zb_get_ext_info);
 
-    ops.def("zb_shmem_is_initialized() -> bool");
-    ops.impl("zb_shmem_is_initialized", c10::DispatchKey::CompositeExplicitAutograd,
-             &vllm_ascend::zb_shmem_is_initialized);
+    ops.def("zb_is_initialized() -> bool");
+    ops.impl("zb_is_initialized", c10::DispatchKey::CompositeExplicitAutograd,
+             &vllm_ascend::zb_is_initialized);
 
 #ifdef VLLM_ASCEND_ENABLE_ZB_OPS
     ops.def(
-        "shmem_moe_distribute_dispatch_zero_buffer("
+        "zb_moe_distribute_dispatch_zero_buffer("
         "    Tensor x, Tensor expert_ids,"
         "    Tensor? scales, Tensor? x_active_mask, Tensor? elastic_info,"
         "    int ep_world_size, int ep_rank_id, int moe_expert_num,"
@@ -2433,11 +2433,11 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
         "    Tensor! ep_recv_count_out, Tensor! tp_recv_count_out"
         ") -> (Tensor expand_x, Tensor dynamic_scales, Tensor assist_info_for_combine,"
         "      Tensor expert_token_nums, Tensor ep_recv_count, Tensor tp_recv_count)");
-    ops.impl("shmem_moe_distribute_dispatch_zero_buffer", torch::kPrivateUse1,
-             &vllm_ascend::shmem_moe_distribute_dispatch_zero_buffer);
+    ops.impl("zb_moe_distribute_dispatch_zero_buffer", torch::kPrivateUse1,
+             &vllm_ascend::zb_moe_distribute_dispatch_zero_buffer);
 
     ops.def(
-        "shmem_moe_distribute_combine_zero_buffer("
+        "zb_moe_distribute_combine_zero_buffer("
         "    Tensor expand_x, Tensor expert_ids, Tensor assist_info_for_combine,"
         "    Tensor ep_send_count, Tensor expert_scales,"
         "    Tensor? tp_send_count, Tensor? x_active_mask,"
@@ -2454,8 +2454,8 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
         "    int zero_expert_num, int copy_expert_num, int const_expert_num,"
         "    Tensor! combined_x"
         ") -> Tensor");
-    ops.impl("shmem_moe_distribute_combine_zero_buffer", torch::kPrivateUse1,
-             &vllm_ascend::shmem_moe_distribute_combine_zero_buffer);
+    ops.impl("zb_moe_distribute_combine_zero_buffer", torch::kPrivateUse1,
+             &vllm_ascend::zb_moe_distribute_combine_zero_buffer);
 
     ops.def(
         "zb_moe_grouped_matmul_gmm2_out("

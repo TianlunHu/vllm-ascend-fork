@@ -16,8 +16,8 @@ import torch
 import torch_npu
 
 SHMEM_MOE_KERNELS = (
-    "ShmemMoeDistributeDispatchZeroBuffer",
-    "ShmemMoeDistributeCombineZeroBuffer",
+    "ZbMoeDistributeDispatchZeroBuffer",
+    "ZbMoeDistributeCombineZeroBuffer",
 )
 
 V2_MOE_KERNELS = (
