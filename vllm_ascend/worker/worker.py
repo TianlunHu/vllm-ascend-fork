@@ -301,6 +301,14 @@ class NPUWorker(WorkerBase):
 
         # Initialize the distributed environment.
         self._init_worker_distributed_environment()
+        # HCCL process-group creation can reset the current NPU device to 0.
+        # Re-bind before model load / profiling so tensors stay on `device`.
+        torch.npu.set_device(device)
+        if int(torch.npu.current_device()) != device.index:
+            raise RuntimeError(
+                f"NPU device drift after distributed init: "
+                f"expected npu:{device.index}, current={torch.npu.current_device()}"
+            )
         # Set random seed.
         set_random_seed(self.model_config.seed)
         # Initialize device properties used by triton kernels.
@@ -334,6 +342,7 @@ class NPUWorker(WorkerBase):
         Then, it calculates the free memory that can be used for KV cache in
         bytes.
         """
+        torch.npu.set_device(self.device)
         GiB = lambda b: b / GiB_bytes
 
         # Fast path: user has explicitly specified KV cache size via
