@@ -42,10 +42,17 @@ from vllm_ascend.ops.fused_moe.token_dispatcher import (
     TokenDispatcherWithAll2AllV,
     TokenDispatcherWithAllGather,
     TokenDispatcherWithMC2,
+    TokenDispatcherWithZB,
 )
 from vllm_ascend.quantization.quant_type import QuantType
 
 _MoECommMethods: dict[MoECommType | None, MoECommMethod] = {}
+
+
+def _create_mc2_token_dispatcher(moe_config):
+    if get_ascend_config().enable_zb:
+        return TokenDispatcherWithZB(moe_config=moe_config)
+    return TokenDispatcherWithMC2(moe_config=moe_config)
 
 
 def get_moe_comm_method(moe_comm_type: MoECommType | None) -> MoECommMethod | None:
@@ -226,7 +233,7 @@ class MC2CommImpl(MoECommMethod):
         return self.prepare_finalize.pad_and_split_input_ids(input_ids)  # type: ignore[attr-defined]
 
     def _get_token_dispatcher(self):
-        return TokenDispatcherWithMC2(moe_config=self.moe_config)
+        return _create_mc2_token_dispatcher(self.moe_config)
 
     def _get_prepare_finalize(self):
         return PrepareAndFinalizeWithMC2(self.moe_config)
@@ -277,7 +284,7 @@ class FusedMC2CommImpl(MoECommMethod):
         return self.prepare_finalize.pad_and_split_input_ids(input_ids)  # type: ignore[attr-defined]
 
     def _get_token_dispatcher(self):
-        return TokenDispatcherWithMC2(moe_config=self.moe_config)
+        return _create_mc2_token_dispatcher(self.moe_config)
 
     def _get_prepare_finalize(self):
         return PrepareAndFinalizeWithMC2(self.moe_config)

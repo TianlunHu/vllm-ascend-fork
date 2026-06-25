@@ -10,6 +10,7 @@ from dataclasses import dataclass
 
 import torch
 
+from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.utils import enable_custom_op
 
 logger = logging.getLogger(__name__)
@@ -188,7 +189,7 @@ def ensure_zb_process_initialized(
 
     if not server_ip_port:
         raise RuntimeError(
-            "VLLM_ASCEND_ENABLE_ZB=1 but VLLM_ASCEND_ZB_SHMEM_URI is unset. "
+            "additional_config.enable_zb=true but additional_config.zb_shmem_uri is unset. "
             "Set it to e.g. tcp://<host>:<port> (identical across all EP ranks)."
         )
 
@@ -234,7 +235,7 @@ class ZbMoERuntime:
 
     def __post_init__(self) -> None:
         if self.server_ip_port is None:
-            self.server_ip_port = os.getenv("VLLM_ASCEND_ZB_SHMEM_URI", "")
+            self.server_ip_port = get_ascend_config().zb_shmem_uri
 
     def init(self) -> int:
         _ensure_custom_op_loaded()

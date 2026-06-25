@@ -44,10 +44,14 @@ All three checks should print `True`.
 
 ### Runtime
 
-| Environment variable | Required | Description |
-| -------------------- | -------- | ----------- |
-| `VLLM_ASCEND_ENABLE_ZB` | Yes (to enable) | Set to `1` to route `TokenDispatcherWithMC2` through ZB dispatch/combine. Legacy alias: `VLLM_ASCEND_ENABLE_ZB_SHMEM`. Default: `0`. |
-| `VLLM_ASCEND_ZB_SHMEM_URI` | Yes (when ZB enabled) | SHMEM control endpoint passed to `aclshmemx_init_attr`, e.g. `tcp://<host>:<port>`. Must be identical on all EP ranks. |
+Enable ZB via `--additional-config` (recommended):
+
+| Key | Required | Description |
+| --- | -------- | ----------- |
+| `enable_zb` | Yes (to enable) | Set to `true` to use `TokenDispatcherWithZB` for SHMEM dispatch/combine. Default: `false`. |
+| `zb_shmem_uri` | Yes (when ZB enabled) | SHMEM control endpoint passed to `aclshmemx_init_attr`, e.g. `tcp://<host>:<port>`. Must be identical on all EP ranks. |
+
+Legacy environment variables (`VLLM_ASCEND_ENABLE_ZB`, `VLLM_ASCEND_ZB_SHMEM_URI`) still work as fallbacks when the corresponding `additional_config` keys are unset.
 
 Optional tuning (defaults are usually sufficient):
 
@@ -63,15 +67,13 @@ See also [Environment Variables](../configuration/env_vars.md) for the full list
 ## How to Use
 
 ```bash
-export VLLM_ASCEND_ENABLE_ZB=1
-export VLLM_ASCEND_ZB_SHMEM_URI=tcp://127.0.0.1:29556   # use a reachable host:port
-
 vllm serve <moe-model> \
   --enable-expert-parallel \
+  --additional-config '{"enable_zb": true, "zb_shmem_uri": "tcp://127.0.0.1:29556"}' \
   ...
 ```
 
-Use the same `VLLM_ASCEND_ZB_SHMEM_URI` on every rank in the EP group.
+Use the same `zb_shmem_uri` on every rank in the EP group.
 
 ## Limitations (current)
 

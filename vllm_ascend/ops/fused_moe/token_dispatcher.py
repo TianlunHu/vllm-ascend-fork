@@ -28,7 +28,6 @@ import torch_npu
 from vllm.config import get_current_vllm_config
 from vllm.distributed.parallel_state import get_ep_group
 
-import vllm_ascend.envs as envs_ascend
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.distributed.parallel_state import get_mc2_group
@@ -61,6 +60,21 @@ def _get_expert_token_nums_type(token_dispatch_input: MoETokenDispatchInput) -> 
     if token_dispatch_input.quant.use_w4a8_per_channel_gmm_swiglu:
         return EXPERT_TOKEN_NUMS_TYPE_COUNT
     return EXPERT_TOKEN_NUMS_TYPE_CUMSUM
+
+
+def _num_tokens_per_tp_rank(vllm_config) -> int:
+    scheduler_config = vllm_config.scheduler_config
+    compilation_config = vllm_config.compilation_config
+    speculative_config = vllm_config.speculative_config
+    tp_size = vllm_config.parallel_config.tensor_parallel_size
+    uniform_decode_query_len = 1 if not speculative_config else 1 + speculative_config.num_speculative_tokens
+    decode_max_num_seqs = getattr(scheduler_config, "decode_max_num_seqs", 0)
+    max_num_reqs = max(scheduler_config.max_num_seqs, decode_max_num_seqs)
+    if compilation_config.cudagraph_capture_sizes:
+        max_num_tokens = compilation_config.max_cudagraph_capture_size
+    else:
+        max_num_tokens = min(max_num_reqs * uniform_decode_query_len, 512)
+    return (max_num_tokens + tp_size - 1) // tp_size
 
 
 class MoETokenDispatcher(ABC, Generic[TMoECombineMetadata]):
@@ -123,22 +137,8 @@ class TokenDispatcherWithMC2(MoETokenDispatcher[MoEMC2CombineMetadata]):
 
         # Here we need to calculate the global_bs = max_bs_per_rank * ep_world_size to execute
         # dispatch & combine operators with different input num_tokens per rank.
-        scheduler_config = vllm_config.scheduler_config
-        compilation_config = vllm_config.compilation_config
-        speculative_config = vllm_config.speculative_config
-        tp_size = vllm_config.parallel_config.tensor_parallel_size
-        uniform_decode_query_len = 1 if not speculative_config else 1 + speculative_config.num_speculative_tokens
-        decode_max_num_seqs = getattr(scheduler_config, "decode_max_num_seqs", 0)
-        max_num_reqs = max(scheduler_config.max_num_seqs, decode_max_num_seqs)
-        if compilation_config.cudagraph_capture_sizes:
-            max_num_tokens = compilation_config.max_cudagraph_capture_size
-        else:
-            max_num_tokens = min(max_num_reqs * uniform_decode_query_len, 512)
-        num_tokens_per_tp_rank = (max_num_tokens + tp_size - 1) // tp_size
+        num_tokens_per_tp_rank = _num_tokens_per_tp_rank(vllm_config)
         _max_global_bs = num_tokens_per_tp_rank * self.ep_world_size
-
-        # Per-EP-rank token cap used to size the SHMEM zero-buffer pool.
-        self._zb_max_tokens_per_rank = num_tokens_per_tp_rank
 
         # When allreduce across DP is not skipped, tokens are uniform across ranks:
         # use global_bs=0 (uniform mode) and pass mc2_mask.
@@ -154,11 +154,217 @@ class TokenDispatcherWithMC2(MoETokenDispatcher[MoEMC2CombineMetadata]):
                 "PTA and CANN version is too old to support mc2 hierarchy comm, please upgrade your version."
             )
 
-        self._zb_enabled = bool(envs_ascend.VLLM_ASCEND_ENABLE_ZB)
+        self.moe_expert_num = 0
+
+    def refresh_hccl_group(self) -> None:
+        """Refresh MC2 communicator metadata after HCCL groups are recreated."""
+        device_group = get_mc2_group().device_group
+        local_rank = torch.distributed.get_rank(group=device_group)
+        backend = device_group._get_backend(torch.device("npu"))
+        self.moe_all_to_all_group_name = backend.get_hccl_comm_name(local_rank)
+
+    def get_dispatch_mc2_kwargs(
+        self,
+        token_dispatch_input: MoETokenDispatchInput,
+    ):
+        hidden_states = token_dispatch_input.hidden_states
+        topk_weights = token_dispatch_input.topk_weights
+        topk_ids = token_dispatch_input.topk_ids
+        expert_map = token_dispatch_input.routing.expert_map
+        global_redundant_expert_num = token_dispatch_input.routing.global_redundant_expert_num
+        comm_quant_mode = token_dispatch_input.quant.comm_quant_mode
+
+        assert expert_map is not None, "expert_map is required for MC2 token dispatch."
+        # NOTE: quant_mode differs by quant feature:
+        # - Legacy int communication quantization uses quant_mode=2.
+        # - A5 MXFP communication uses quant_mode=4.
+        if comm_quant_mode is not None:
+            quant_mode = comm_quant_mode
+        elif token_dispatch_input.quant.dispatch_with_quant:
+            quant_mode = 4 if self.a5_need_extra_args and token_dispatch_input.quant.is_mxfp else 2
+        else:
+            quant_mode = 0
+        self.moe_expert_num = len(expert_map) + global_redundant_expert_num
+        expert_token_nums_type = _get_expert_token_nums_type(token_dispatch_input)
+        kwargs_mc2 = {
+            "x": hidden_states,
+            "expert_ids": topk_ids,
+            "expert_shard_type": 0,
+            "shared_expert_rank_num": 0,
+            "moe_expert_num": self.moe_expert_num,
+            "global_bs": self.global_bs,
+            "expert_token_nums_type": expert_token_nums_type,
+        }
+        if self.global_bs == 0:
+            kwargs_mc2["x_active_mask"] = token_dispatch_input.routing.mc2_mask
+
+        stage1_kwargs = {
+            "scales": None,
+            "quant_mode": quant_mode,
+            "group_ep": self.moe_all_to_all_group_name,
+            "ep_world_size": self.ep_world_size,
+            "ep_rank_id": self.ep_rank_id,
+        }
+        if self.need_extra_args:
+            stage1_kwargs.update(
+                {
+                    "group_tp": self.moe_all_to_all_group_name,
+                    "tp_world_size": 1,
+                    "tp_rank_id": 0,
+                }
+            )
+        # Only dispatch-enabled MXFP paths pass y_dtype through MC2.
+        if (
+            self.a5_need_extra_args
+            and (token_dispatch_input.quant.is_mxfp or token_dispatch_input.quant.is_fp8)
+            and token_dispatch_input.quant.dispatch_with_quant
+        ):
+            y_dtype = torch.float8_e4m3fn
+            if (
+                token_dispatch_input.quant.mxfp is not None
+                and token_dispatch_input.quant.mxfp.act_quant_type is not None
+            ):
+                y_dtype = token_dispatch_input.quant.mxfp.act_quant_type
+            stage1_kwargs.update({"tp_world_size": 1, "tp_rank_id": 0, "y_dtype": y_dtype})
+        if self.need_expert_scale or self.a5_need_extra_args:
+            stage1_kwargs.update(
+                {
+                    "expert_scales": topk_weights.to(torch.float32),
+                }
+            )
+        if self.need_comm_alg:
+            stage1_kwargs.update({"comm_alg": "hierarchy"})
+
+        kwargs_mc2.update(stage1_kwargs)
+        return kwargs_mc2
+
+    def token_dispatch(
+        self,
+        token_dispatch_input: MoETokenDispatchInput,
+    ):
+        kwargs_mc2 = self.get_dispatch_mc2_kwargs(token_dispatch_input)
+        output = (
+            torch_npu.npu_moe_distribute_dispatch_v2(**kwargs_mc2)
+            if self.enable_dispatch_v2
+            else torch_npu.npu_moe_distribute_dispatch(**kwargs_mc2)
+        )
+        # comm_stream.wait_stream(torch.npu.current_stream())
+        (
+            expand_x,
+            dynamic_scale,
+            assist_info_for_combine,
+            expert_token_nums,
+            ep_recv_counts,
+            tp_recv_counts,
+            expand_scales,
+        ) = output[0:7]
+
+        group_list_type = kwargs_mc2["expert_token_nums_type"]
+        return MoETokenDispatchOutput(
+            hidden_states=expand_x,
+            dynamic_scale=dynamic_scale,
+            group_list=expert_token_nums,
+            group_list_type=group_list_type,
+            combine_metadata=MoEMC2CombineMetadata(
+                topk_ids=token_dispatch_input.topk_ids,
+                topk_weights=token_dispatch_input.topk_weights,
+                expert_map=token_dispatch_input.routing.expert_map,
+                ep_recv_counts=ep_recv_counts,
+                tp_recv_counts=tp_recv_counts,
+                assist_info_for_combine=assist_info_for_combine,
+                expand_scales=expand_scales,
+                quant=token_dispatch_input.quant,
+                mc2_mask=token_dispatch_input.routing.mc2_mask if self.global_bs == 0 else None,
+            ),
+        )
+
+    def get_combine_mc_kwargs(self, hidden_states: torch.Tensor, combine_metadata: MoEMC2CombineMetadata):
+        expert_map = combine_metadata.expert_map
+        topk_ids = combine_metadata.topk_ids
+        topk_weights = combine_metadata.topk_weights
+        ep_recv_counts = combine_metadata.ep_recv_counts
+        tp_recv_counts = combine_metadata.tp_recv_counts
+        assist_info_for_combine = combine_metadata.assist_info_for_combine
+        expand_scales = combine_metadata.expand_scales
+        quant_type = combine_metadata.quant.quant_type
+        comm_quant_mode = combine_metadata.quant.comm_quant_mode
+
+        assert expert_map is not None
+        # NOTE: quant_mode differs by quant features:
+        # - A5 MXFP communication uses quant_mode=4 only for MXFP8 currently.
+        if comm_quant_mode is not None:
+            quant_mode = comm_quant_mode
+        elif quant_type == QuantType.MXFP8:
+            quant_mode = 4
+        else:
+            quant_mode = 0
+        kwargs_mc2 = {
+            "expand_x": hidden_states,
+            "expert_ids": topk_ids,
+            "expert_scales": topk_weights.to(torch.float32),
+            "expert_shard_type": 0,
+            "shared_expert_rank_num": 0,
+            "moe_expert_num": self.moe_expert_num,
+            "global_bs": self.global_bs,
+        }
+        if self.global_bs == 0:
+            kwargs_mc2["x_active_mask"] = combine_metadata.mc2_mask
+
+        if combine_metadata.quant.dispatch_with_quant:
+            tp_recv_counts = torch.empty(1, dtype=torch.int32, device=hidden_states.device)
+
+        stage3_kwargs = {
+            "ep_send_counts": ep_recv_counts,
+            "group_ep": self.moe_all_to_all_group_name,
+            "ep_world_size": self.ep_world_size,
+            "ep_rank_id": self.ep_rank_id,
+            "expand_scales": expand_scales,
+            "comm_quant_mode": quant_mode,
+        }
+
+        if self.enable_dispatch_v2:
+            stage3_kwargs["assist_info_for_combine"] = assist_info_for_combine
+        else:
+            stage3_kwargs["expand_idx"] = assist_info_for_combine
+
+        if self.need_extra_args:
+            stage3_kwargs.update(
+                {
+                    "tp_send_counts": tp_recv_counts,
+                    "group_tp": self.moe_all_to_all_group_name,
+                    "tp_world_size": 1,
+                    "tp_rank_id": 0,
+                }
+            )
+        if self.need_comm_alg:
+            stage3_kwargs.update({"comm_alg": "hierarchy"})
+
+        kwargs_mc2.update(stage3_kwargs)
+        return kwargs_mc2
+
+    def token_combine(self, hidden_states, combine_metadata, bias=None):
+        assert bias is None, "Bias is not supported in MoEAlltoAllvTokenDispatcher."
+
+        kwargs_mc2 = self.get_combine_mc_kwargs(hidden_states, combine_metadata)
+        combined_output = (
+            torch_npu.npu_moe_distribute_combine_v2(**kwargs_mc2)
+            if self.enable_dispatch_v2
+            else torch_npu.npu_moe_distribute_combine(**kwargs_mc2)
+        )
+
+        return combined_output
+
+
+class TokenDispatcherWithZB(TokenDispatcherWithMC2):
+    """MC2 token dispatcher with zero-buffer SHMEM dispatch/combine."""
+
+    def __init__(self, moe_config=None, **kwargs):
+        super().__init__(moe_config=moe_config, **kwargs)
         self._moe_config = moe_config
-        if self._zb_enabled:
-            self._validate_zb_compat()
-            self._ensure_zb_runtime_init()
+        vllm_config = get_current_vllm_config()
+        self._zb_max_tokens_per_rank = _num_tokens_per_tp_rank(vllm_config)
+        self._validate_zb_compat()
+        self._ensure_zb_runtime_init()
         # SHMEM process runtime is process-wide; per-dispatcher tensor/aux buffers
         # are populated lazily on first token_dispatch.
         self._zb_runtime = None
@@ -170,23 +376,23 @@ class TokenDispatcherWithMC2(MoETokenDispatcher[MoEMC2CombineMetadata]):
         self._zb_moe_expert_num = None
         self._zb_use_quant = None
         self._zb_dispatch_quant_mode = None
-        self.moe_expert_num = 0
 
     def _validate_zb_compat(self) -> None:
         if not self.need_extra_args:
             raise RuntimeError(
-                "VLLM_ASCEND_ENABLE_ZB=1 requires A3/A5 hardware; current "
+                "additional_config.enable_zb=true requires A3/A5 hardware; current "
                 f"device type does not match (need_extra_args={self.need_extra_args})."
             )
         if self.need_comm_alg:
             raise RuntimeError(
-                "VLLM_ASCEND_ENABLE_ZB=1 is incompatible with enable_mc2_hierarchy_comm; disable one of them."
+                "additional_config.enable_zb=true is incompatible with enable_mc2_hierarchy_comm; "
+                "disable one of them."
             )
         enable_custom_op()
         ascend_ops = getattr(torch.ops, "_C_ascend", None)
         if ascend_ops is None or not hasattr(ascend_ops, "zb_moe_distribute_dispatch_zero_buffer"):
             raise RuntimeError(
-                "VLLM_ASCEND_ENABLE_ZB=1 but zero-buffer ops are not registered. "
+                "additional_config.enable_zb=true but zero-buffer ops are not registered. "
                 "Install Ascend SHMEM at /usr/local/Ascend/shmem/latest and rebuild vllm_ascend."
             )
 
@@ -220,9 +426,8 @@ class TokenDispatcherWithMC2(MoETokenDispatcher[MoEMC2CombineMetadata]):
         moe_expert_num = self._resolve_zb_moe_expert_num()
         if moe_expert_num <= 0:
             raise RuntimeError(
-                "VLLM_ASCEND_ENABLE_ZB=1 but moe_expert_num is unknown at "
-                "dispatcher init; pass moe_config with num_experts to "
-                "TokenDispatcherWithMC2."
+                "additional_config.enable_zb=true but moe_expert_num is unknown at "
+                "dispatcher init; pass moe_config with num_experts to TokenDispatcherWithZB."
             )
 
         # Non-quant sizing is larger (separate combine_x + expand_x_out buffers).
@@ -233,7 +438,7 @@ class TokenDispatcherWithMC2(MoETokenDispatcher[MoEMC2CombineMetadata]):
             moe_expert_num=moe_expert_num,
             use_quant=False,
         )
-        uri = envs_ascend.VLLM_ASCEND_ZB_SHMEM_URI
+        uri = get_ascend_config().zb_shmem_uri
         runtime = ensure_zb_process_initialized(
             rank=self.ep_rank_id,
             world_size=self.ep_world_size,
@@ -347,7 +552,7 @@ class TokenDispatcherWithMC2(MoETokenDispatcher[MoEMC2CombineMetadata]):
         use_quant: bool,
         device: torch.device,
     ) -> None:
-        if self._zb_enabled and self._zb_runtime is None:
+        if self._zb_runtime is None:
             self._ensure_zb_runtime_init()
         self._ensure_zb_buffers(
             hidden=hidden,
@@ -355,88 +560,6 @@ class TokenDispatcherWithMC2(MoETokenDispatcher[MoEMC2CombineMetadata]):
             use_quant=use_quant,
             device=device,
         )
-
-    def refresh_hccl_group(self) -> None:
-        """Refresh MC2 communicator metadata after HCCL groups are recreated."""
-        device_group = get_mc2_group().device_group
-        local_rank = torch.distributed.get_rank(group=device_group)
-        backend = device_group._get_backend(torch.device("npu"))
-        self.moe_all_to_all_group_name = backend.get_hccl_comm_name(local_rank)
-
-    def get_dispatch_mc2_kwargs(
-        self,
-        token_dispatch_input: MoETokenDispatchInput,
-    ):
-        hidden_states = token_dispatch_input.hidden_states
-        topk_weights = token_dispatch_input.topk_weights
-        topk_ids = token_dispatch_input.topk_ids
-        expert_map = token_dispatch_input.routing.expert_map
-        global_redundant_expert_num = token_dispatch_input.routing.global_redundant_expert_num
-        comm_quant_mode = token_dispatch_input.quant.comm_quant_mode
-
-        assert expert_map is not None, "expert_map is required for MC2 token dispatch."
-        # NOTE: quant_mode differs by quant feature:
-        # - Legacy int communication quantization uses quant_mode=2.
-        # - A5 MXFP communication uses quant_mode=4.
-        if comm_quant_mode is not None:
-            quant_mode = comm_quant_mode
-        elif token_dispatch_input.quant.dispatch_with_quant:
-            quant_mode = 4 if self.a5_need_extra_args and token_dispatch_input.quant.is_mxfp else 2
-        else:
-            quant_mode = 0
-        self.moe_expert_num = len(expert_map) + global_redundant_expert_num
-        expert_token_nums_type = _get_expert_token_nums_type(token_dispatch_input)
-        kwargs_mc2 = {
-            "x": hidden_states,
-            "expert_ids": topk_ids,
-            "expert_shard_type": 0,
-            "shared_expert_rank_num": 0,
-            "moe_expert_num": self.moe_expert_num,
-            "global_bs": self.global_bs,
-            "expert_token_nums_type": expert_token_nums_type,
-        }
-        if self.global_bs == 0:
-            kwargs_mc2["x_active_mask"] = token_dispatch_input.routing.mc2_mask
-
-        stage1_kwargs = {
-            "scales": None,
-            "quant_mode": quant_mode,
-            "group_ep": self.moe_all_to_all_group_name,
-            "ep_world_size": self.ep_world_size,
-            "ep_rank_id": self.ep_rank_id,
-        }
-        if self.need_extra_args:
-            stage1_kwargs.update(
-                {
-                    "group_tp": self.moe_all_to_all_group_name,
-                    "tp_world_size": 1,
-                    "tp_rank_id": 0,
-                }
-            )
-        # Only dispatch-enabled MXFP paths pass y_dtype through MC2.
-        if (
-            self.a5_need_extra_args
-            and (token_dispatch_input.quant.is_mxfp or token_dispatch_input.quant.is_fp8)
-            and token_dispatch_input.quant.dispatch_with_quant
-        ):
-            y_dtype = torch.float8_e4m3fn
-            if (
-                token_dispatch_input.quant.mxfp is not None
-                and token_dispatch_input.quant.mxfp.act_quant_type is not None
-            ):
-                y_dtype = token_dispatch_input.quant.mxfp.act_quant_type
-            stage1_kwargs.update({"tp_world_size": 1, "tp_rank_id": 0, "y_dtype": y_dtype})
-        if self.need_expert_scale or self.a5_need_extra_args:
-            stage1_kwargs.update(
-                {
-                    "expert_scales": topk_weights.to(torch.float32),
-                }
-            )
-        if self.need_comm_alg:
-            stage1_kwargs.update({"comm_alg": "hierarchy"})
-
-        kwargs_mc2.update(stage1_kwargs)
-        return kwargs_mc2
 
     def _compute_comm_quant_mode(self, quant: MoEQuantParams) -> int:
         if quant.comm_quant_mode is not None:
@@ -448,9 +571,10 @@ class TokenDispatcherWithMC2(MoETokenDispatcher[MoEMC2CombineMetadata]):
     def _compute_dispatch_quant_mode(self, token_dispatch_input: MoETokenDispatchInput) -> int:
         return self._compute_comm_quant_mode(token_dispatch_input.quant)
 
-    def _token_dispatch_zb(
-        self, token_dispatch_input: MoETokenDispatchInput
-    ) -> MoETokenDispatchOutput[MoEMC2CombineMetadata]:
+    def token_dispatch(
+        self,
+        token_dispatch_input: MoETokenDispatchInput,
+    ):
         from vllm_ascend.ops.fused_moe.zb_runtime import (
             zb_moe_distribute_dispatch_zero_buffer,
         )
@@ -478,7 +602,7 @@ class TokenDispatcherWithMC2(MoETokenDispatcher[MoEMC2CombineMetadata]):
         self._zb_dispatch_quant_mode = quant_mode
 
         assert self._zb_runtime is not None and self._zb_bundle is not None and self._zb_aux is not None, (
-            "token_dispatch_zb failed to initialize SHMEM buffers."
+            "TokenDispatcherWithZB failed to initialize SHMEM buffers."
         )
         bundle = self._zb_bundle
         aux = self._zb_aux
@@ -534,123 +658,19 @@ class TokenDispatcherWithMC2(MoETokenDispatcher[MoEMC2CombineMetadata]):
             ),
         )
 
-    def token_dispatch(
-        self,
-        token_dispatch_input: MoETokenDispatchInput,
-    ):
-        if self._zb_enabled:
-            return self._token_dispatch_zb(token_dispatch_input)
-        kwargs_mc2 = self.get_dispatch_mc2_kwargs(token_dispatch_input)
-        output = (
-            torch_npu.npu_moe_distribute_dispatch_v2(**kwargs_mc2)
-            if self.enable_dispatch_v2
-            else torch_npu.npu_moe_distribute_dispatch(**kwargs_mc2)
-        )
-        # comm_stream.wait_stream(torch.npu.current_stream())
-        (
-            expand_x,
-            dynamic_scale,
-            assist_info_for_combine,
-            expert_token_nums,
-            ep_recv_counts,
-            tp_recv_counts,
-            expand_scales,
-        ) = output[0:7]
-
-        group_list_type = kwargs_mc2["expert_token_nums_type"]
-        return MoETokenDispatchOutput(
-            hidden_states=expand_x,
-            dynamic_scale=dynamic_scale,
-            group_list=expert_token_nums,
-            group_list_type=group_list_type,
-            combine_metadata=MoEMC2CombineMetadata(
-                topk_ids=token_dispatch_input.topk_ids,
-                topk_weights=token_dispatch_input.topk_weights,
-                expert_map=token_dispatch_input.routing.expert_map,
-                ep_recv_counts=ep_recv_counts,
-                tp_recv_counts=tp_recv_counts,
-                assist_info_for_combine=assist_info_for_combine,
-                expand_scales=expand_scales,
-                quant=token_dispatch_input.quant,
-                mc2_mask=token_dispatch_input.routing.mc2_mask if self.global_bs == 0 else None,
-            ),
-        )
-
-    def get_combine_mc_kwargs(self, hidden_states: torch.Tensor, combine_metadata: MoEMC2CombineMetadata):
-        expert_map = combine_metadata.expert_map
-        topk_ids = combine_metadata.topk_ids
-        topk_weights = combine_metadata.topk_weights
-        ep_recv_counts = combine_metadata.ep_recv_counts
-        tp_recv_counts = combine_metadata.tp_recv_counts
-        assist_info_for_combine = combine_metadata.assist_info_for_combine
-        expand_scales = combine_metadata.expand_scales
-        quant_type = combine_metadata.quant.quant_type
-        comm_quant_mode = combine_metadata.quant.comm_quant_mode
-
-        assert expert_map is not None
-        # NOTE: quant_mode differs by quant features:
-        # - A5 MXFP communication uses quant_mode=4 only for MXFP8 currently.
-        if comm_quant_mode is not None:
-            quant_mode = comm_quant_mode
-        elif quant_type == QuantType.MXFP8:
-            quant_mode = 4
-        else:
-            quant_mode = 0
-        kwargs_mc2 = {
-            "expand_x": hidden_states,
-            "expert_ids": topk_ids,
-            "expert_scales": topk_weights.to(torch.float32),
-            "expert_shard_type": 0,
-            "shared_expert_rank_num": 0,
-            "moe_expert_num": self.moe_expert_num,
-            "global_bs": self.global_bs,
-        }
-        if self.global_bs == 0:
-            kwargs_mc2["x_active_mask"] = combine_metadata.mc2_mask
-
-        if combine_metadata.quant.dispatch_with_quant:
-            tp_recv_counts = torch.empty(1, dtype=torch.int32, device=hidden_states.device)
-
-        stage3_kwargs = {
-            "ep_send_counts": ep_recv_counts,
-            "group_ep": self.moe_all_to_all_group_name,
-            "ep_world_size": self.ep_world_size,
-            "ep_rank_id": self.ep_rank_id,
-            "expand_scales": expand_scales,
-            "comm_quant_mode": quant_mode,
-        }
-
-        if self.enable_dispatch_v2:
-            stage3_kwargs["assist_info_for_combine"] = assist_info_for_combine
-        else:
-            stage3_kwargs["expand_idx"] = assist_info_for_combine
-
-        if self.need_extra_args:
-            stage3_kwargs.update(
-                {
-                    "tp_send_counts": tp_recv_counts,
-                    "group_tp": self.moe_all_to_all_group_name,
-                    "tp_world_size": 1,
-                    "tp_rank_id": 0,
-                }
-            )
-        if self.need_comm_alg:
-            stage3_kwargs.update({"comm_alg": "hierarchy"})
-
-        kwargs_mc2.update(stage3_kwargs)
-        return kwargs_mc2
-
-    def _token_combine_zb(
+    def token_combine(
         self,
         hidden_states: torch.Tensor,
         combine_metadata: MoEMC2CombineMetadata,
+        bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
         from vllm_ascend.ops.fused_moe.zb_runtime import (
             zb_moe_distribute_combine_zero_buffer,
         )
 
+        assert bias is None, "Bias is not supported in MoEAlltoAllvTokenDispatcher."
         assert self._zb_runtime is not None and self._zb_bundle is not None, (
-            "token_combine_zb called before token_dispatch_zb initialized the SHMEM runtime."
+            "TokenDispatcherWithZB.token_combine called before token_dispatch initialized SHMEM runtime."
         )
         bundle = self._zb_bundle
         runtime = self._zb_runtime
@@ -699,21 +719,6 @@ class TokenDispatcherWithMC2(MoETokenDispatcher[MoEMC2CombineMetadata]):
             comm_quant_mode=comm_quant_mode,
         )
         return combined_x
-
-    def token_combine(self, hidden_states, combine_metadata, bias=None):
-        assert bias is None, "Bias is not supported in MoEAlltoAllvTokenDispatcher."
-
-        if self._zb_enabled:
-            return self._token_combine_zb(hidden_states, combine_metadata)
-
-        kwargs_mc2 = self.get_combine_mc_kwargs(hidden_states, combine_metadata)
-        combined_output = (
-            torch_npu.npu_moe_distribute_combine_v2(**kwargs_mc2)
-            if self.enable_dispatch_v2
-            else torch_npu.npu_moe_distribute_combine(**kwargs_mc2)
-        )
-
-        return combined_output
 
 
 class TokenDispatcherWithAllGather(MoETokenDispatcher[MoEAllGatherCombineMetadata]):
