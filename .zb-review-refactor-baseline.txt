@@ -1,0 +1,27 @@
+# ZB review refactor baseline (before comment1 + comment3)
+# Branch: feature/zb-moe-zero-buffer
+# Commit: 6ac7a428 [Kernel][Communicator] Add zero-buffer MoE dispatch/combine for A3 EP
+# Date: 2026-06-25
+#
+# Planned follow-up commit:
+#   - Comment1: split TokenDispatcherWithZB(TokenDispatcherWithMC2)
+#   - Comment3: enable_zb + zb_shmem_uri -> AscendConfig additional_config
+#   - Comment2 (device patch): NOT in this commit — deferred
+#
+# git status at baseline: clean working tree
+
+# --- WIP status (2026-06-01) ---
+# Comment1: DONE — TokenDispatcherWithZB subclass; MC2CommImpl uses _create_mc2_token_dispatcher()
+# Comment3: DONE — ascend_config.enable_zb / zb_shmem_uri; env vars deprecated fallback
+# Comment2: DEFERRED — patch_distributed / npu_communicator device changes unchanged
+#
+# Modified files (uncommitted):
+#   vllm_ascend/ascend_config.py
+#   vllm_ascend/envs.py
+#   vllm_ascend/ops/fused_moe/moe_comm_method.py
+#   vllm_ascend/ops/fused_moe/token_dispatcher.py
+#   vllm_ascend/ops/fused_moe/zb_runtime.py
+#   docs/source/user_guide/feature_guide/zero_buffer_moe.md
+#
+# Suggested commit message:
+#   [Refactor] Split ZB token dispatcher and move enable flags to additional_config
