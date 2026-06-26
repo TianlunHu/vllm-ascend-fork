@@ -344,7 +344,7 @@ class ZbMoERuntime:
         self.finalize()
 
 
-def zb_moe_distribute_dispatch_zero_buffer(
+def zb_moe_distribute_dispatch(
     x: torch.Tensor,
     expert_ids: torch.Tensor,
     expand_x_out: torch.Tensor,
@@ -374,14 +374,14 @@ def zb_moe_distribute_dispatch_zero_buffer(
     copy_expert_num: int = 0,
     const_expert_num: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Thin Python wrapper around torch.ops._C_ascend.zb_moe_distribute_dispatch_zero_buffer.
+    """Thin Python wrapper around torch.ops._C_ascend.zb_moe_distribute_dispatch.
 
     All output tensors must be pre-allocated by the caller. ``ext_info`` is the
     SHMEM global virtual address returned by :py:meth:`ZbMoERuntime.alloc` /
     :py:meth:`ZbMoERuntime.get_ext_info`.
     """
-    _ensure_zb_op_available("zb_moe_distribute_dispatch_zero_buffer")
-    return torch.ops._C_ascend.zb_moe_distribute_dispatch_zero_buffer(
+    _ensure_zb_op_available("zb_moe_distribute_dispatch")
+    return torch.ops._C_ascend.zb_moe_distribute_dispatch(
         x,
         expert_ids,
         scales,
@@ -412,7 +412,7 @@ def zb_moe_distribute_dispatch_zero_buffer(
     )
 
 
-def zb_moe_distribute_combine_zero_buffer(
+def zb_moe_distribute_combine(
     expand_x: torch.Tensor,
     expert_ids: torch.Tensor,
     assist_info_for_combine: torch.Tensor,
@@ -450,19 +450,19 @@ def zb_moe_distribute_combine_zero_buffer(
     copy_expert_num: int = 0,
     const_expert_num: int = 0,
 ) -> torch.Tensor:
-    """Thin Python wrapper around torch.ops._C_ascend.zb_moe_distribute_combine_zero_buffer.
+    """Thin Python wrapper around torch.ops._C_ascend.zb_moe_distribute_combine.
 
     ``combined_x`` must be pre-allocated by the caller. ``ext_info`` is the
     SHMEM global virtual address used as the combine source buffer pointer
-    (typically the same value used by ``zb_moe_distribute_dispatch_zero_buffer``).
+    (typically the same value used by ``zb_moe_distribute_dispatch``).
     """
-    _ensure_zb_op_available("zb_moe_distribute_combine_zero_buffer")
+    _ensure_zb_op_available("zb_moe_distribute_combine")
     if tp_send_count is None:
         # The combine tiling marks tp_send_count optional, but still validates
         # its shape and dtype. deepep_standalone always passes an int32 tensor
         # with one entry per TP rank even when tp_world_size == 1.
         tp_send_count = torch.empty((tp_world_size,), dtype=torch.int32, device=expand_x.device)
-    return torch.ops._C_ascend.zb_moe_distribute_combine_zero_buffer(
+    return torch.ops._C_ascend.zb_moe_distribute_combine(
         expand_x,
         expert_ids,
         assist_info_for_combine,

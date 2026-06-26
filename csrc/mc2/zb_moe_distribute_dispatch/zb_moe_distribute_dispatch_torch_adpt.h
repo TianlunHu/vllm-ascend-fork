@@ -19,7 +19,7 @@
 namespace vllm_ascend {
 
 std::tuple<at::Tensor &, at::Tensor &, at::Tensor &, at::Tensor &, at::Tensor &, at::Tensor &>
-zb_moe_distribute_dispatch_zero_buffer(
+zb_moe_distribute_dispatch(
     const at::Tensor &x,
     const at::Tensor &expert_ids,
     const c10::optional<at::Tensor> &scales,
@@ -51,7 +51,7 @@ zb_moe_distribute_dispatch_zero_buffer(
     std::string comm_alg_str(comm_alg.data(), comm_alg.size());
     char *comm_alg_ptr = comm_alg_str.empty() ? nullptr : const_cast<char *>(comm_alg_str.c_str());
 
-    EXEC_NPU_CMD(aclnnZbMoeDistributeDispatchZeroBuffer,
+    EXEC_NPU_CMD(aclnnZbMoeDistributeDispatch,
                  x,
                  expert_ids,
                  scales.has_value() ? scales.value() : at::Tensor(),

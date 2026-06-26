@@ -4,7 +4,7 @@
 #include <cstdint>
 #include "kernel_tiling/kernel_tiling.h"
 
-struct ZbMoeDistributeDispatchZeroBufferInfo {
+struct ZbMoeDistributeDispatchInfo {
     uint32_t epWorldSize;          // epWorldSize
     uint32_t tpWorldSize;          // tpWorldSize
     uint32_t epRankId;             // epRankId
@@ -31,11 +31,11 @@ struct ZbMoeDistributeDispatchZeroBufferInfo {
     uint64_t shmemptr;             // shmem ptr for MetaInfo
 };
 
-struct ZbMoeDistributeDispatchZeroBufferTilingData {
+struct ZbMoeDistributeDispatchTilingData {
     Mc2InitTiling mc2InitTiling;
     Mc2CcTiling mc2CcTiling1;
     Mc2CcTiling mc2CcTiling2;
-    ZbMoeDistributeDispatchZeroBufferInfo moeDistributeDispatchZeroBufferInfo;
+    ZbMoeDistributeDispatchInfo moeDistributeDispatchInfo;
 };
 
 #endif

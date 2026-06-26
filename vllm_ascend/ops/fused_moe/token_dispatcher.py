@@ -390,7 +390,7 @@ class TokenDispatcherWithZB(TokenDispatcherWithMC2):
             )
         enable_custom_op()
         ascend_ops = getattr(torch.ops, "_C_ascend", None)
-        if ascend_ops is None or not hasattr(ascend_ops, "zb_moe_distribute_dispatch_zero_buffer"):
+        if ascend_ops is None or not hasattr(ascend_ops, "zb_moe_distribute_dispatch"):
             raise RuntimeError(
                 "additional_config.enable_zb=true but zero-buffer ops are not registered. "
                 "Install Ascend SHMEM at /usr/local/Ascend/shmem/latest and rebuild vllm_ascend."
@@ -576,7 +576,7 @@ class TokenDispatcherWithZB(TokenDispatcherWithMC2):
         token_dispatch_input: MoETokenDispatchInput,
     ):
         from vllm_ascend.ops.fused_moe.zb_runtime import (
-            zb_moe_distribute_dispatch_zero_buffer,
+            zb_moe_distribute_dispatch,
         )
 
         hidden_states = token_dispatch_input.hidden_states
@@ -608,7 +608,7 @@ class TokenDispatcherWithZB(TokenDispatcherWithMC2):
         aux = self._zb_aux
         runtime = self._zb_runtime
 
-        zb_moe_distribute_dispatch_zero_buffer(
+        zb_moe_distribute_dispatch(
             x=hidden_states,
             expert_ids=topk_ids,
             expand_x_out=bundle.expand_x_out,
@@ -665,7 +665,7 @@ class TokenDispatcherWithZB(TokenDispatcherWithMC2):
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
         from vllm_ascend.ops.fused_moe.zb_runtime import (
-            zb_moe_distribute_combine_zero_buffer,
+            zb_moe_distribute_combine,
         )
 
         assert bias is None, "Bias is not supported in MoEAlltoAllvTokenDispatcher."
@@ -698,7 +698,7 @@ class TokenDispatcherWithZB(TokenDispatcherWithMC2):
             device=hidden_states.device,
         )
 
-        zb_moe_distribute_combine_zero_buffer(
+        zb_moe_distribute_combine(
             expand_x=expand_x,
             expert_ids=combine_metadata.topk_ids,
             assist_info_for_combine=combine_metadata.assist_info_for_combine,

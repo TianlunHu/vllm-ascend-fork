@@ -1,8 +1,12 @@
-# Zero-Buffer MoE (ZB) for Expert Parallel
+# ZB MoE for Expert Parallel
+
+**ZB** stands for **zero-buffer**: SHMEM-backed MoE dispatch/combine that avoids
+extra staging buffers on the hot path. Throughout this project, paths, operators,
+and config keys use the `zb_` prefix only (for example `zb_moe_distribute_dispatch`).
 
 ## Overview
 
-Zero-buffer (ZB) MoE is an optional expert-parallel (EP) communication path on Ascend A3/A5.
+Zero-buffer MoE is an optional expert-parallel (EP) communication path on Ascend A3/A5.
 When enabled, MoE **dispatch** and **combine** use custom operators backed by Ascend SHMEM
 instead of the default PTA `npu_moe_distribute_dispatch_v2` / `combine_v2` path. Expert MLP
 **gmm2** can write directly into the SHMEM `combine_x` buffer, so combine can run with
@@ -32,8 +36,8 @@ Verify registration after install:
 python3 -c "
 import torch
 for op in (
-    'zb_moe_distribute_dispatch_zero_buffer',
-    'zb_moe_distribute_combine_zero_buffer',
+    'zb_moe_distribute_dispatch',
+    'zb_moe_distribute_combine',
     'zb_moe_grouped_matmul_gmm2_out',
 ):
     print(op, hasattr(torch.ops._C_ascend, op))

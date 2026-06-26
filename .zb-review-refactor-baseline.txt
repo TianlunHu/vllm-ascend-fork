@@ -21,7 +21,7 @@
 #   vllm_ascend/ops/fused_moe/moe_comm_method.py
 #   vllm_ascend/ops/fused_moe/token_dispatcher.py
 #   vllm_ascend/ops/fused_moe/zb_runtime.py
-#   docs/source/user_guide/feature_guide/zero_buffer_moe.md
+#   docs/source/user_guide/feature_guide/zb_moe.md
 #
 # Suggested commit message:
 #   [Refactor] Split ZB token dispatcher and move enable flags to additional_config

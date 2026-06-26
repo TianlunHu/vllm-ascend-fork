@@ -18,7 +18,7 @@
 
 namespace vllm_ascend {
 
-at::Tensor &zb_moe_distribute_combine_zero_buffer(
+at::Tensor &zb_moe_distribute_combine(
     const at::Tensor &expand_x,
     const at::Tensor &expert_ids,
     const at::Tensor &assist_info_for_combine,
@@ -58,7 +58,7 @@ at::Tensor &zb_moe_distribute_combine_zero_buffer(
     std::string comm_alg_str(comm_alg.data(), comm_alg.size());
     char *comm_alg_ptr = comm_alg_str.empty() ? nullptr : const_cast<char *>(comm_alg_str.c_str());
 
-    EXEC_NPU_CMD(aclnnZbMoeDistributeCombineZeroBuffer,
+    EXEC_NPU_CMD(aclnnZbMoeDistributeCombine,
                  expand_x,
                  expert_ids,
                  assist_info_for_combine,
