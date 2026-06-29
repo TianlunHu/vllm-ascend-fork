@@ -7,7 +7,6 @@ import logging
 import os
 from collections.abc import Sequence
 from dataclasses import dataclass
-from urllib.parse import urlparse
 
 import torch
 
@@ -35,21 +34,17 @@ ZB_POOL_ALIGN_BYTES = 2 * 1024 * 1024
 
 DEFAULT_COMM_ALG = "fullmesh_v1"
 
-# aclshmem conf-store must not bind the same TCP port as torch.distributed TCPStore.
-DEFAULT_ZB_SHMEM_PORT_OFFSET = 10000
-
 # Process-wide runtime created by ensure_zb_process_initialized().
 _ZB_PROCESS_RUNTIME: ZbMoERuntime | None = None
 
-# Set by NPUWorker after HCCL init; vLLM passes rendezvous as distributed_init_method
-# without always exporting MASTER_ADDR / MASTER_PORT into os.environ.
-_ZB_DISTRIBUTED_INIT_METHOD: str | None = None
+# aclshmem conf-store URI reserved at worker startup (one free port per MC2 group).
+_ZB_SHMEM_CONF_STORE_URI: str | None = None
 
 
-def set_zb_distributed_init_method(init_method: str | None) -> None:
-    """Record vLLM worker rendezvous URI for aclshmem conf-store (ZB SHMEM)."""
-    global _ZB_DISTRIBUTED_INIT_METHOD
-    _ZB_DISTRIBUTED_INIT_METHOD = init_method
+def set_zb_shmem_conf_store_uri(uri: str | None) -> None:
+    """Record the aclshmem conf-store URI reserved for this worker/MC2 group."""
+    global _ZB_SHMEM_CONF_STORE_URI
+    _ZB_SHMEM_CONF_STORE_URI = uri
 
 
 def _env_int(name: str, default: int) -> int:
@@ -194,74 +189,81 @@ def _format_tcp_uri(host: str, port: int) -> str:
     return f"tcp://{host}:{port}"
 
 
-def _parse_tcp_init_method(init_method: str) -> tuple[str, int]:
+def _parse_tcp_host_port(init_method: str) -> tuple[str, int]:
     normalized = init_method.strip()
     if "://" not in normalized:
         normalized = f"tcp://{normalized}"
-    parsed = urlparse(normalized)
-    if parsed.scheme != "tcp":
+    scheme, _, remainder = normalized.partition("://")
+    if scheme != "tcp":
         raise RuntimeError(f"ZB SHMEM requires a tcp:// HCCL rendezvous, got: {init_method!r}")
-    host = parsed.hostname
-    port = parsed.port
-    if not host or port is None:
+    if remainder.startswith("["):
+        end = remainder.index("]")
+        host = remainder[1:end]
+        _, _, port_str = remainder[end + 1 :].partition(":")
+    else:
+        host, _, port_str = remainder.rpartition(":")
+    if not host or not port_str:
         raise RuntimeError(f"cannot parse host/port from HCCL rendezvous: {init_method!r}")
-    return host, port
+    return host, int(port_str)
 
 
-def _derive_zb_shmem_port(hccl_port: int) -> int:
-    """Pick a conf-store port from the HCCL rendezvous without colliding with TCPStore."""
-    port_offset = _env_int("VLLM_ASCEND_ZB_SHMEM_PORT_OFFSET", DEFAULT_ZB_SHMEM_PORT_OFFSET)
-    group_salt = 0
-    try:
-        from vllm_ascend.distributed.parallel_state import get_mc2_group
+def reserve_zb_shmem_conf_store_uri(hccl_init_method: str) -> str:
+    """Reserve a free TCP port for aclshmem conf-store (shared within each MC2 group).
 
-        mc2 = get_mc2_group()
-        if mc2.ranks:
-            # When TP>1 splits MC2 into multiple EP groups, give each group its own session.
-            group_salt = min(mc2.ranks)
-    except (AssertionError, ImportError):
-        pass
-    return hccl_port + port_offset + group_salt
+    Reuses the HCCL rendezvous host but picks a dedicated port via ``get_open_port()``,
+    broadcast from the MC2 group leader so every rank in the group shares the same URI
+    without colliding with the HCCL TCPStore port.
+    """
+    from vllm.utils.network_utils import get_open_port
 
+    from vllm_ascend.distributed.parallel_state import get_mc2_group
 
-def _shmem_uri_from_hccl_init_method(init_method: str) -> str:
-    host, hccl_port = _parse_tcp_init_method(init_method)
-    return _format_tcp_uri(host, _derive_zb_shmem_port(hccl_port))
+    host, _ = _parse_tcp_host_port(hccl_init_method)
+    mc2 = get_mc2_group()
+    port_tensor = torch.tensor([0], dtype=torch.int64)
+
+    if mc2.rank_in_group == 0:
+        port_tensor[0] = get_open_port()
+
+    torch.distributed.broadcast(
+        port_tensor,
+        src=mc2.ranks[0],
+        group=mc2.cpu_group,
+    )
+    shmem_port = int(port_tensor.item())
+    if shmem_port <= 0 or shmem_port > 65535:
+        raise RuntimeError(f"invalid SHMEM conf-store port broadcast result: {shmem_port}")
+
+    uri = _format_tcp_uri(host, shmem_port)
+    set_zb_shmem_conf_store_uri(uri)
+    logger.info(
+        "Reserved ZB SHMEM conf-store URI %s (HCCL rendezvous %s)",
+        uri,
+        hccl_init_method,
+    )
+    return uri
 
 
 def resolve_zb_shmem_uri() -> str:
-    """Resolve aclshmem conf-store URI from the vLLM HCCL rendezvous.
+    """Resolve aclshmem conf-store URI for this worker.
 
     Serving path (no extra config):
       1. ``NPUWorker._init_worker_distributed_environment`` calls
-         ``set_zb_distributed_init_method(distributed_init_method)`` after HCCL init.
-      2. ``ensure_zb_process_initialized`` reads the recorded init method here.
+         ``reserve_zb_shmem_conf_store_uri`` after MC2 groups are created.
+      2. ``ensure_zb_process_initialized`` reads the reserved URI here.
 
-    The SHMEM conf-store reuses the **same host** as HCCL but binds a **different TCP
-    port** (``hccl_port + VLLM_ASCEND_ZB_SHMEM_PORT_OFFSET [+ mc2_group_salt]``).
-    Reusing the HCCL TCPStore port directly makes ``aclshmemx_init_attr`` fail.
-
-    Fallback order: e2e override env → recorded ``distributed_init_method`` →
-    ``MASTER_ADDR``/``MASTER_PORT``.
+    Fallback order: e2e override env → reserved conf-store URI.
     """
     override = os.getenv("VLLM_ASCEND_ZB_SHMEM_URI") or os.getenv("VLLM_ASCEND_ZB_URI")
     if override:
         return override if "://" in override else f"tcp://{override}"
 
-    if _ZB_DISTRIBUTED_INIT_METHOD:
-        init_method = _ZB_DISTRIBUTED_INIT_METHOD.strip()
-        if init_method:
-            return _shmem_uri_from_hccl_init_method(init_method)
-
-    master_addr = os.environ.get("MASTER_ADDR")
-    master_port = os.environ.get("MASTER_PORT")
-    if master_addr and master_port:
-        return _shmem_uri_from_hccl_init_method(f"tcp://{master_addr}:{master_port}")
+    if _ZB_SHMEM_CONF_STORE_URI:
+        return _ZB_SHMEM_CONF_STORE_URI
 
     raise RuntimeError(
-        "additional_config.enable_mc2_zb=true but HCCL rendezvous URI is unavailable. "
-        "ZB SHMEM derives its conf-store endpoint from the torch.distributed / HCCL "
-        "rendezvous recorded at worker init_device. "
+        "additional_config.enable_mc2_zb=true but ZB SHMEM conf-store URI is unavailable. "
+        "Serving workers must call reserve_zb_shmem_conf_store_uri() after MC2 init. "
         "For standalone e2e tests only, set VLLM_ASCEND_ZB_SHMEM_URI."
     )
 
@@ -315,8 +317,8 @@ def ensure_zb_process_initialized(
             "aclshmem process init failed for additional_config.enable_mc2_zb=true. "
             f"uri={server_ip_port!r}, rank={rank}, world_size={world_size}, "
             f"local_mem_size={local_mem_size}. SHMEM conf-store uses a dedicated TCP "
-            "port derived from the HCCL rendezvous (not the TCPStore port). "
-            "Check that the derived port is free, all MC2 ranks enter init together, "
+            "port reserved at worker startup (separate from the HCCL TCPStore port). "
+            "Check that the reserved port is free, all MC2 ranks enter init together, "
             "and host DRAM can satisfy local_mem_size. "
             "Set VLLM_ASCEND_ZB_DEBUG=1 for C++ init logs."
         ) from exc

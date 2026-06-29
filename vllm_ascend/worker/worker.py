@@ -1007,9 +1007,6 @@ class NPUWorker(WorkerBase):
         init_distributed_environment(
             self.parallel_config.world_size, self.rank, self.distributed_init_method, self.local_rank, "hccl"
         )
-        from vllm_ascend.ops.fused_moe.zb_runtime import set_zb_distributed_init_method
-
-        set_zb_distributed_init_method(self.distributed_init_method)
         ensure_model_parallel_initialized(
             self.parallel_config.tensor_parallel_size,
             self.parallel_config.pipeline_parallel_size,
@@ -1017,6 +1014,10 @@ class NPUWorker(WorkerBase):
             self.parallel_config.decode_context_parallel_size,
         )
         init_ascend_model_parallel(self.parallel_config)
+        if get_ascend_config().enable_mc2_zb:
+            from vllm_ascend.ops.fused_moe.zb_runtime import reserve_zb_shmem_conf_store_uri
+
+            reserve_zb_shmem_conf_store_uri(self.distributed_init_method)
         ensure_ec_transfer_initialized(self.vllm_config)
 
     def get_supported_pooling_tasks(self):
