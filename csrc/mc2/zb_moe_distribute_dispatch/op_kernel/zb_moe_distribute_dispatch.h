@@ -7,8 +7,8 @@
  * History: 2026-01-03 create ZbMoeDistributeDispatch operator kernel function header file
  */
 
-#ifndef SHMEM_MOE_DISTRIBUTE_DISPATCH_ZEROBUFFER_H
-#define SHMEM_MOE_DISTRIBUTE_DISPATCH_ZEROBUFFER_H
+#ifndef ZB_MOE_DISTRIBUTE_DISPATCH_H
+#define ZB_MOE_DISTRIBUTE_DISPATCH_H
 
 #include "shmem.h"
 #include "kernel_operator.h"
@@ -871,4 +871,4 @@ __aicore__ inline void ZbMoeDistributeDispatch<TemplateMC2TypeFunc>::Process()
 }
 
 }  // namespace ZbMoeDistributeDispatchImpl
-#endif  // SHMEM_MOE_DISTRIBUTE_DISPATCH_ZEROBUFFER_H
+#endif  // ZB_MOE_DISTRIBUTE_DISPATCH_H

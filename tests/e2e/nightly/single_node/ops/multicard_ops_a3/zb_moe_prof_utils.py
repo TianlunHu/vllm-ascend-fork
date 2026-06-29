@@ -16,7 +16,7 @@ import numpy as np
 import torch
 import torch_npu
 
-SHMEM_MOE_KERNELS = (
+ZB_MOE_KERNELS = (
     "ZbMoeDistributeDispatch",
     "ZbMoeDistributeCombine",
 )

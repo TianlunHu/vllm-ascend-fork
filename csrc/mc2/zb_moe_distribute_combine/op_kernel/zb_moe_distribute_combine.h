@@ -6,8 +6,8 @@
  * Note:
  * History: 2026-01-22 create ZbMoeDistributeCombine operator kernel function header file, for a3
  */
-#ifndef SHMEM_MOE_DISTRIBUTE_COMBINE_ZEROBUFFER_H
-#define SHMEM_MOE_DISTRIBUTE_COMBINE_ZEROBUFFER_H
+#ifndef ZB_MOE_DISTRIBUTE_COMBINE_H
+#define ZB_MOE_DISTRIBUTE_COMBINE_H
 
 #include "kernel_operator.h"
 #include "kernel_tiling/kernel_tiling.h"
@@ -458,4 +458,4 @@ __aicore__ inline void ZbMoeDistributeCombine<TemplateMC2TypeFunc>::Process()
 }
 
 }  // namespace ZbMoeDistributeCombineImpl
-#endif  // SHMEM_MOE_DISTRIBUTE_COMBINE_ZEROBUFFER_H
+#endif  // ZB_MOE_DISTRIBUTE_COMBINE_H

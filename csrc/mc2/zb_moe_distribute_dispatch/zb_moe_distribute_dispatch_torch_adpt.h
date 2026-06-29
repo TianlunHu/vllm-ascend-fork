@@ -13,8 +13,8 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#ifndef SHMEM_MOE_DISTRIBUTE_DISPATCH_ZERO_BUFFER_TORCH_ADPT_H
-#define SHMEM_MOE_DISTRIBUTE_DISPATCH_ZERO_BUFFER_TORCH_ADPT_H
+#ifndef ZB_MOE_DISTRIBUTE_DISPATCH_TORCH_ADPT_H
+#define ZB_MOE_DISTRIBUTE_DISPATCH_TORCH_ADPT_H
 
 namespace vllm_ascend {
 
@@ -86,4 +86,4 @@ zb_moe_distribute_dispatch(
 
 }  // namespace vllm_ascend
 
-#endif  // SHMEM_MOE_DISTRIBUTE_DISPATCH_ZERO_BUFFER_TORCH_ADPT_H
+#endif  // ZB_MOE_DISTRIBUTE_DISPATCH_TORCH_ADPT_H

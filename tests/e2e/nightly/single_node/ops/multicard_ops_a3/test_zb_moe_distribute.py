@@ -79,7 +79,7 @@ from moe_mc2_e2e_common import (  # type: ignore[import-not-found,import-untyped
     mc2_world_size,
 )
 from zb_moe_prof_utils import (  # type: ignore[import-not-found,import-untyped]
-    SHMEM_MOE_KERNELS,
+    ZB_MOE_KERNELS,
     V2_MOE_KERNELS,
     bench,
     bench_kineto,
@@ -481,7 +481,7 @@ def _run_bench(ctx: ZbMoeOpContext) -> None:
 
     zb_kernels = bench_kineto(
         partial(ctx.run_zb_dispatch_combine),
-        kernel_names=SHMEM_MOE_KERNELS,
+        kernel_names=ZB_MOE_KERNELS,
         num_warmups=num_warmups,
         num_tests=num_tests,
         suppress_kineto_output=True,
@@ -496,7 +496,7 @@ def _run_bench(ctx: ZbMoeOpContext) -> None:
     print_kernel_table(
         rank=ctx.rank,
         label="ZB SHMEM kernels (same round-trip session as wall-clock)",
-        kernel_names=SHMEM_MOE_KERNELS,
+        kernel_names=ZB_MOE_KERNELS,
         dispatch_t=zb_kernels[0],
         combine_t=zb_kernels[1],
         num_warmups=num_warmups,
@@ -556,7 +556,7 @@ def _run_profile(ctx: ZbMoeOpContext) -> None:
     )
     dist.barrier()
 
-    zb_summary = msprof_kernel_summary(zb_root, SHMEM_MOE_KERNELS)
+    zb_summary = msprof_kernel_summary(zb_root, ZB_MOE_KERNELS)
     pta_summary = msprof_kernel_summary(pta_root, V2_MOE_KERNELS)
 
     print_msprof_trace_info(
@@ -565,7 +565,7 @@ def _run_profile(ctx: ZbMoeOpContext) -> None:
         trace_root=zb_root,
         num_warmups=num_warmups,
         num_tests=profile_iters,
-        kernel_names=SHMEM_MOE_KERNELS,
+        kernel_names=ZB_MOE_KERNELS,
         kernel_durations=zb_summary,
     )
     print_msprof_trace_info(
