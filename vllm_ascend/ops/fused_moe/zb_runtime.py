@@ -174,6 +174,34 @@ def get_zb_process_runtime() -> ZbMoERuntime | None:
     return _ZB_PROCESS_RUNTIME
 
 
+def resolve_zb_shmem_uri() -> str:
+    """Resolve aclshmem conf-store URI from the HCCL/torch.distributed rendezvous.
+
+    vLLM workers already pass ``distributed_init_method`` (``tcp://host:port``) into
+    ``init_distributed_environment``, which sets ``MASTER_ADDR`` / ``MASTER_PORT``.
+    aclshmemx_init_attr expects the same ``tcp://`` form, so ZB reuses it instead
+    of a separate ``additional_config`` URI.
+
+    ``VLLM_ASCEND_ZB_SHMEM_URI`` remains an optional override for standalone e2e tests.
+    """
+    override = os.getenv("VLLM_ASCEND_ZB_SHMEM_URI") or os.getenv("VLLM_ASCEND_ZB_URI")
+    if override:
+        return override if "://" in override else f"tcp://{override}"
+
+    master_addr = os.environ.get("MASTER_ADDR")
+    master_port = os.environ.get("MASTER_PORT")
+    if master_addr and master_port:
+        if ":" in master_addr and not master_addr.startswith("["):
+            return f"tcp://[{master_addr}]:{master_port}"
+        return f"tcp://{master_addr}:{master_port}"
+
+    raise RuntimeError(
+        "additional_config.enable_mc2_zb=true but HCCL rendezvous URI is unavailable. "
+        "Ensure torch.distributed / HCCL init has run (MASTER_ADDR and MASTER_PORT must be set), "
+        "or set VLLM_ASCEND_ZB_SHMEM_URI for standalone tests."
+    )
+
+
 def ensure_zb_process_initialized(
     rank: int,
     world_size: int,
@@ -188,10 +216,7 @@ def ensure_zb_process_initialized(
         return _ZB_PROCESS_RUNTIME
 
     if not server_ip_port:
-        raise RuntimeError(
-            "additional_config.enable_zb=true but additional_config.zb_shmem_uri is unset. "
-            "Set it to e.g. tcp://<host>:<port> (identical across all EP ranks)."
-        )
+        server_ip_port = resolve_zb_shmem_uri()
 
     runtime = ZbMoERuntime(
         rank=rank,
@@ -235,7 +260,7 @@ class ZbMoERuntime:
 
     def __post_init__(self) -> None:
         if self.server_ip_port is None:
-            self.server_ip_port = get_ascend_config().zb_shmem_uri
+            self.server_ip_port = resolve_zb_shmem_uri()
 
     def init(self) -> int:
         _ensure_custom_op_loaded()

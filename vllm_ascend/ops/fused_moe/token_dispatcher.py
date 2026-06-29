@@ -380,19 +380,19 @@ class TokenDispatcherWithZB(TokenDispatcherWithMC2):
     def _validate_zb_compat(self) -> None:
         if not self.need_extra_args:
             raise RuntimeError(
-                "additional_config.enable_zb=true requires A3/A5 hardware; current "
+                "additional_config.enable_mc2_zb=true requires A3/A5 hardware; current "
                 f"device type does not match (need_extra_args={self.need_extra_args})."
             )
         if self.need_comm_alg:
             raise RuntimeError(
-                "additional_config.enable_zb=true is incompatible with enable_mc2_hierarchy_comm; "
+                "additional_config.enable_mc2_zb=true is incompatible with enable_mc2_hierarchy_comm; "
                 "disable one of them."
             )
         enable_custom_op()
         ascend_ops = getattr(torch.ops, "_C_ascend", None)
         if ascend_ops is None or not hasattr(ascend_ops, "zb_moe_distribute_dispatch"):
             raise RuntimeError(
-                "additional_config.enable_zb=true but zero-buffer ops are not registered. "
+                "additional_config.enable_mc2_zb=true but zero-buffer ops are not registered. "
                 "Install Ascend SHMEM at /usr/local/Ascend/shmem/latest and rebuild vllm_ascend."
             )
 
@@ -413,6 +413,7 @@ class TokenDispatcherWithZB(TokenDispatcherWithMC2):
             ensure_zb_process_initialized,
             estimate_zb_early_local_mem_size,
             get_zb_process_runtime,
+            resolve_zb_shmem_uri,
         )
 
         existing = get_zb_process_runtime()
@@ -426,7 +427,7 @@ class TokenDispatcherWithZB(TokenDispatcherWithMC2):
         moe_expert_num = self._resolve_zb_moe_expert_num()
         if moe_expert_num <= 0:
             raise RuntimeError(
-                "additional_config.enable_zb=true but moe_expert_num is unknown at "
+                "additional_config.enable_mc2_zb=true but moe_expert_num is unknown at "
                 "dispatcher init; pass moe_config with num_experts to TokenDispatcherWithZB."
             )
 
@@ -438,7 +439,7 @@ class TokenDispatcherWithZB(TokenDispatcherWithMC2):
             moe_expert_num=moe_expert_num,
             use_quant=False,
         )
-        uri = get_ascend_config().zb_shmem_uri
+        uri = resolve_zb_shmem_uri()
         runtime = ensure_zb_process_initialized(
             rank=self.ep_rank_id,
             world_size=self.ep_world_size,

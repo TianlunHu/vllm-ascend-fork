@@ -1,12 +1,12 @@
 # ZB MoE for Expert Parallel
 
-**ZB** stands for **zero-buffer**: SHMEM-backed MoE dispatch/combine that avoids
+**ZB** stands for **zero buffer**: SHMEM-backed MoE dispatch/combine that avoids
 extra staging buffers on the hot path. Throughout this project, paths, operators,
 and config keys use the `zb_` prefix only (for example `zb_moe_distribute_dispatch`).
 
 ## Overview
 
-Zero-buffer MoE is an optional expert-parallel (EP) communication path on Ascend A3/A5.
+Zero buffer MoE is an optional expert-parallel (EP) communication path on Ascend A3/A5.
 When enabled, MoE **dispatch** and **combine** use custom operators backed by Ascend SHMEM
 instead of the default PTA `npu_moe_distribute_dispatch_v2` / `combine_v2` path. Expert MLP
 **gmm2** can write directly into the SHMEM `combine_x` buffer, so combine can run with
@@ -48,14 +48,18 @@ All three checks should print `True`.
 
 ### Runtime
 
-Enable ZB via `--additional-config` (recommended):
+Enable ZB via `--additional-config`:
 
 | Key | Required | Description |
 | --- | -------- | ----------- |
-| `enable_zb` | Yes (to enable) | Set to `true` to use `TokenDispatcherWithZB` for SHMEM dispatch/combine. Default: `false`. |
-| `zb_shmem_uri` | Yes (when ZB enabled) | SHMEM control endpoint passed to `aclshmemx_init_attr`, e.g. `tcp://<host>:<port>`. Must be identical on all EP ranks. |
+| `enable_mc2_zb` | Yes (to enable) | Set to `true` to use `TokenDispatcherWithZB` for SHMEM dispatch/combine. Default: `false`. |
 
-Legacy environment variables (`VLLM_ASCEND_ENABLE_ZB`, `VLLM_ASCEND_ZB_SHMEM_URI`) still work as fallbacks when the corresponding `additional_config` keys are unset.
+aclshmem conf-store URI is taken from the same HCCL / torch.distributed rendezvous as worker
+startup (`MASTER_ADDR` + `MASTER_PORT`, i.e. the `distributed_init_method` passed to
+`init_distributed_environment`). No separate URI is required in `additional_config`.
+
+Legacy environment variable `VLLM_ASCEND_ENABLE_ZB` still works as a fallback when
+`enable_mc2_zb` is unset.
 
 Optional tuning (defaults are usually sufficient):
 
@@ -64,6 +68,7 @@ Optional tuning (defaults are usually sufficient):
 | `VLLM_ASCEND_ZB_LOCAL_MEM_SIZE` | Override local SHMEM pool size (bytes). |
 | `VLLM_ASCEND_ZB_EXT_INFO_BYTES` | Size of the per-process `ext_info` SHMEM allocation. |
 | `VLLM_ASCEND_ZB_POOL_SLACK_BYTES` | Extra slack added when estimating local memory. |
+| `VLLM_ASCEND_ZB_SHMEM_URI` | Override conf-store URI (standalone e2e tests only; serving reuses HCCL rendezvous). |
 
 See also [Environment Variables](../configuration/env_vars.md) for the full list pulled from
 `vllm_ascend/envs.py`.
@@ -73,11 +78,9 @@ See also [Environment Variables](../configuration/env_vars.md) for the full list
 ```bash
 vllm serve <moe-model> \
   --enable-expert-parallel \
-  --additional-config '{"enable_zb": true, "zb_shmem_uri": "tcp://127.0.0.1:29556"}' \
+  --additional-config '{"enable_mc2_zb": true}' \
   ...
 ```
-
-Use the same `zb_shmem_uri` on every rank in the EP group.
 
 ## Limitations (current)
 
@@ -99,3 +102,6 @@ export VLLM_ASCEND_ZB_SHMEM_URI=tcp://127.0.0.1:29556
 ./run_zb_gmm2_to_combine_x_test.sh         # gmm2 -> combine_x full path
 ./run_zb_moe_distribute_test.sh bench      # optional benchmark vs PTA v2
 ```
+
+Standalone e2e tests set `MASTER_ADDR` / `MASTER_PORT` or `VLLM_ASCEND_ZB_SHMEM_URI` explicitly
+because they do not go through the full vLLM worker bootstrap.

@@ -50,7 +50,7 @@ _MoECommMethods: dict[MoECommType | None, MoECommMethod] = {}
 
 
 def _create_mc2_token_dispatcher(moe_config):
-    if get_ascend_config().enable_zb:
+    if get_ascend_config().enable_mc2_zb:
         return TokenDispatcherWithZB(moe_config=moe_config)
     return TokenDispatcherWithMC2(moe_config=moe_config)
 
