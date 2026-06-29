@@ -37,6 +37,16 @@ DEFAULT_COMM_ALG = "fullmesh_v1"
 # Process-wide runtime created by ensure_zb_process_initialized().
 _ZB_PROCESS_RUNTIME: ZbMoERuntime | None = None
 
+# Set by NPUWorker after HCCL init; vLLM passes rendezvous as distributed_init_method
+# without always exporting MASTER_ADDR / MASTER_PORT into os.environ.
+_ZB_DISTRIBUTED_INIT_METHOD: str | None = None
+
+
+def set_zb_distributed_init_method(init_method: str | None) -> None:
+    """Record vLLM worker rendezvous URI for aclshmem conf-store (ZB SHMEM)."""
+    global _ZB_DISTRIBUTED_INIT_METHOD
+    _ZB_DISTRIBUTED_INIT_METHOD = init_method
+
 
 def _env_int(name: str, default: int) -> int:
     raw = os.getenv(name)
@@ -194,6 +204,11 @@ def resolve_zb_shmem_uri() -> str:
         if ":" in master_addr and not master_addr.startswith("["):
             return f"tcp://[{master_addr}]:{master_port}"
         return f"tcp://{master_addr}:{master_port}"
+
+    if _ZB_DISTRIBUTED_INIT_METHOD:
+        init_method = _ZB_DISTRIBUTED_INIT_METHOD.strip()
+        if init_method:
+            return init_method if "://" in init_method else f"tcp://{init_method}"
 
     raise RuntimeError(
         "additional_config.enable_mc2_zb=true but HCCL rendezvous URI is unavailable. "

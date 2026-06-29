@@ -1007,6 +1007,9 @@ class NPUWorker(WorkerBase):
         init_distributed_environment(
             self.parallel_config.world_size, self.rank, self.distributed_init_method, self.local_rank, "hccl"
         )
+        from vllm_ascend.ops.fused_moe.zb_runtime import set_zb_distributed_init_method
+
+        set_zb_distributed_init_method(self.distributed_init_method)
         ensure_model_parallel_initialized(
             self.parallel_config.tensor_parallel_size,
             self.parallel_config.pipeline_parallel_size,
