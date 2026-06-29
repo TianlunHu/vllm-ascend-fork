@@ -185,18 +185,24 @@ def get_zb_process_runtime() -> ZbMoERuntime | None:
 
 
 def resolve_zb_shmem_uri() -> str:
-    """Resolve aclshmem conf-store URI from the HCCL/torch.distributed rendezvous.
+    """Resolve aclshmem conf-store URI by reusing the vLLM HCCL rendezvous.
 
-    vLLM workers already pass ``distributed_init_method`` (``tcp://host:port``) into
-    ``init_distributed_environment``, which sets ``MASTER_ADDR`` / ``MASTER_PORT``.
-    aclshmemx_init_attr expects the same ``tcp://`` form, so ZB reuses it instead
-    of a separate ``additional_config`` URI.
+    Serving path (no extra config):
+      1. ``NPUWorker._init_worker_distributed_environment`` calls
+         ``set_zb_distributed_init_method(distributed_init_method)`` after HCCL init.
+      2. First ZB dispatch calls ``ensure_zb_process_initialized`` which reads it here.
 
-    ``VLLM_ASCEND_ZB_SHMEM_URI`` remains an optional override for standalone e2e tests.
+    Fallback order: e2e override env → ``MASTER_ADDR``/``MASTER_PORT`` → recorded
+    ``distributed_init_method``.
     """
     override = os.getenv("VLLM_ASCEND_ZB_SHMEM_URI") or os.getenv("VLLM_ASCEND_ZB_URI")
     if override:
         return override if "://" in override else f"tcp://{override}"
+
+    if _ZB_DISTRIBUTED_INIT_METHOD:
+        init_method = _ZB_DISTRIBUTED_INIT_METHOD.strip()
+        if init_method:
+            return init_method if "://" in init_method else f"tcp://{init_method}"
 
     master_addr = os.environ.get("MASTER_ADDR")
     master_port = os.environ.get("MASTER_PORT")
@@ -205,15 +211,11 @@ def resolve_zb_shmem_uri() -> str:
             return f"tcp://[{master_addr}]:{master_port}"
         return f"tcp://{master_addr}:{master_port}"
 
-    if _ZB_DISTRIBUTED_INIT_METHOD:
-        init_method = _ZB_DISTRIBUTED_INIT_METHOD.strip()
-        if init_method:
-            return init_method if "://" in init_method else f"tcp://{init_method}"
-
     raise RuntimeError(
         "additional_config.enable_mc2_zb=true but HCCL rendezvous URI is unavailable. "
-        "Ensure torch.distributed / HCCL init has run (MASTER_ADDR and MASTER_PORT must be set), "
-        "or set VLLM_ASCEND_ZB_SHMEM_URI for standalone tests."
+        "ZB SHMEM reuses the same tcp:// rendezvous as torch.distributed / HCCL; "
+        "ensure worker init_device (HCCL) completed before the first ZB MoE dispatch. "
+        "For standalone e2e tests only, set VLLM_ASCEND_ZB_SHMEM_URI."
     )
 
 
