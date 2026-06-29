@@ -7,6 +7,7 @@ import logging
 import os
 from collections.abc import Sequence
 from dataclasses import dataclass
+from urllib.parse import urlparse
 
 import torch
 
@@ -33,6 +34,9 @@ DEFAULT_ZB_POOL_SLACK_BYTES = 32 * 1024 * 1024
 ZB_POOL_ALIGN_BYTES = 2 * 1024 * 1024
 
 DEFAULT_COMM_ALG = "fullmesh_v1"
+
+# aclshmem conf-store must not bind the same TCP port as torch.distributed TCPStore.
+DEFAULT_ZB_SHMEM_PORT_OFFSET = 10000
 
 # Process-wide runtime created by ensure_zb_process_initialized().
 _ZB_PROCESS_RUNTIME: ZbMoERuntime | None = None
@@ -184,16 +188,61 @@ def get_zb_process_runtime() -> ZbMoERuntime | None:
     return _ZB_PROCESS_RUNTIME
 
 
+def _format_tcp_uri(host: str, port: int) -> str:
+    if ":" in host and not host.startswith("["):
+        return f"tcp://[{host}]:{port}"
+    return f"tcp://{host}:{port}"
+
+
+def _parse_tcp_init_method(init_method: str) -> tuple[str, int]:
+    normalized = init_method.strip()
+    if "://" not in normalized:
+        normalized = f"tcp://{normalized}"
+    parsed = urlparse(normalized)
+    if parsed.scheme != "tcp":
+        raise RuntimeError(f"ZB SHMEM requires a tcp:// HCCL rendezvous, got: {init_method!r}")
+    host = parsed.hostname
+    port = parsed.port
+    if not host or port is None:
+        raise RuntimeError(f"cannot parse host/port from HCCL rendezvous: {init_method!r}")
+    return host, port
+
+
+def _derive_zb_shmem_port(hccl_port: int) -> int:
+    """Pick a conf-store port from the HCCL rendezvous without colliding with TCPStore."""
+    port_offset = _env_int("VLLM_ASCEND_ZB_SHMEM_PORT_OFFSET", DEFAULT_ZB_SHMEM_PORT_OFFSET)
+    group_salt = 0
+    try:
+        from vllm_ascend.distributed.parallel_state import get_mc2_group
+
+        mc2 = get_mc2_group()
+        if mc2.ranks:
+            # When TP>1 splits MC2 into multiple EP groups, give each group its own session.
+            group_salt = min(mc2.ranks)
+    except (AssertionError, ImportError):
+        pass
+    return hccl_port + port_offset + group_salt
+
+
+def _shmem_uri_from_hccl_init_method(init_method: str) -> str:
+    host, hccl_port = _parse_tcp_init_method(init_method)
+    return _format_tcp_uri(host, _derive_zb_shmem_port(hccl_port))
+
+
 def resolve_zb_shmem_uri() -> str:
-    """Resolve aclshmem conf-store URI by reusing the vLLM HCCL rendezvous.
+    """Resolve aclshmem conf-store URI from the vLLM HCCL rendezvous.
 
     Serving path (no extra config):
       1. ``NPUWorker._init_worker_distributed_environment`` calls
          ``set_zb_distributed_init_method(distributed_init_method)`` after HCCL init.
-      2. First ZB dispatch calls ``ensure_zb_process_initialized`` which reads it here.
+      2. ``ensure_zb_process_initialized`` reads the recorded init method here.
 
-    Fallback order: e2e override env → ``MASTER_ADDR``/``MASTER_PORT`` → recorded
-    ``distributed_init_method``.
+    The SHMEM conf-store reuses the **same host** as HCCL but binds a **different TCP
+    port** (``hccl_port + VLLM_ASCEND_ZB_SHMEM_PORT_OFFSET [+ mc2_group_salt]``).
+    Reusing the HCCL TCPStore port directly makes ``aclshmemx_init_attr`` fail.
+
+    Fallback order: e2e override env → recorded ``distributed_init_method`` →
+    ``MASTER_ADDR``/``MASTER_PORT``.
     """
     override = os.getenv("VLLM_ASCEND_ZB_SHMEM_URI") or os.getenv("VLLM_ASCEND_ZB_URI")
     if override:
@@ -202,21 +251,31 @@ def resolve_zb_shmem_uri() -> str:
     if _ZB_DISTRIBUTED_INIT_METHOD:
         init_method = _ZB_DISTRIBUTED_INIT_METHOD.strip()
         if init_method:
-            return init_method if "://" in init_method else f"tcp://{init_method}"
+            return _shmem_uri_from_hccl_init_method(init_method)
 
     master_addr = os.environ.get("MASTER_ADDR")
     master_port = os.environ.get("MASTER_PORT")
     if master_addr and master_port:
-        if ":" in master_addr and not master_addr.startswith("["):
-            return f"tcp://[{master_addr}]:{master_port}"
-        return f"tcp://{master_addr}:{master_port}"
+        return _shmem_uri_from_hccl_init_method(f"tcp://{master_addr}:{master_port}")
 
     raise RuntimeError(
         "additional_config.enable_mc2_zb=true but HCCL rendezvous URI is unavailable. "
-        "ZB SHMEM reuses the same tcp:// rendezvous as torch.distributed / HCCL; "
-        "ensure worker init_device (HCCL) completed before the first ZB MoE dispatch. "
+        "ZB SHMEM derives its conf-store endpoint from the torch.distributed / HCCL "
+        "rendezvous recorded at worker init_device. "
         "For standalone e2e tests only, set VLLM_ASCEND_ZB_SHMEM_URI."
     )
+
+
+def _synchronize_zb_init_peers() -> None:
+    """Barrier MC2 peers before aclshmem conf-store rendezvous."""
+    try:
+        from vllm_ascend.distributed.parallel_state import get_mc2_group
+
+        mc2 = get_mc2_group()
+        if mc2.world_size > 1:
+            torch.distributed.barrier(group=mc2.device_group)
+    except AssertionError:
+        pass
 
 
 def ensure_zb_process_initialized(
@@ -234,6 +293,13 @@ def ensure_zb_process_initialized(
 
     if not server_ip_port:
         server_ip_port = resolve_zb_shmem_uri()
+    logger.info(
+        "Initializing ZB aclshmem (rank=%s/%s, local_mem_size=%s, uri=%s)",
+        rank,
+        world_size,
+        local_mem_size,
+        server_ip_port,
+    )
 
     runtime = ZbMoERuntime(
         rank=rank,
@@ -241,7 +307,19 @@ def ensure_zb_process_initialized(
         server_ip_port=server_ip_port,
         local_mem_size=local_mem_size,
     )
-    runtime.init()
+    _synchronize_zb_init_peers()
+    try:
+        runtime.init()
+    except RuntimeError as exc:
+        raise RuntimeError(
+            "aclshmem process init failed for additional_config.enable_mc2_zb=true. "
+            f"uri={server_ip_port!r}, rank={rank}, world_size={world_size}, "
+            f"local_mem_size={local_mem_size}. SHMEM conf-store uses a dedicated TCP "
+            "port derived from the HCCL rendezvous (not the TCPStore port). "
+            "Check that the derived port is free, all MC2 ranks enter init together, "
+            "and host DRAM can satisfy local_mem_size. "
+            "Set VLLM_ASCEND_ZB_DEBUG=1 for C++ init logs."
+        ) from exc
     _ZB_PROCESS_RUNTIME = runtime
     return runtime
 

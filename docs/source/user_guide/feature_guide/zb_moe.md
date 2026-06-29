@@ -54,9 +54,10 @@ Enable ZB via `--additional-config`:
 | --- | -------- | ----------- |
 | `enable_mc2_zb` | Yes (to enable) | Set to `true` to use `TokenDispatcherWithZB` for SHMEM dispatch/combine. Default: `false`. |
 
-aclshmem conf-store URI is taken from the same HCCL / torch.distributed rendezvous as worker
-startup (`MASTER_ADDR` + `MASTER_PORT`, i.e. the `distributed_init_method` passed to
-`init_distributed_environment`). No separate URI is required in `additional_config`.
+aclshmem conf-store URI is derived automatically from the same host as HCCL /
+torch.distributed rendezvous (`distributed_init_method` at worker startup), but uses a
+**separate TCP port** (`hccl_port + 10000` by default). Do not point it at the HCCL
+TCPStore port. No separate URI is required in `additional_config`.
 
 Legacy environment variable `VLLM_ASCEND_ENABLE_ZB` still works as a fallback when
 `enable_mc2_zb` is unset.
@@ -68,7 +69,9 @@ Optional tuning (defaults are usually sufficient):
 | `VLLM_ASCEND_ZB_LOCAL_MEM_SIZE` | Override local SHMEM pool size (bytes). |
 | `VLLM_ASCEND_ZB_EXT_INFO_BYTES` | Size of the per-process `ext_info` SHMEM allocation. |
 | `VLLM_ASCEND_ZB_POOL_SLACK_BYTES` | Extra slack added when estimating local memory. |
-| `VLLM_ASCEND_ZB_SHMEM_URI` | Override conf-store URI (standalone e2e tests only; serving reuses HCCL rendezvous). |
+| `VLLM_ASCEND_ZB_SHMEM_URI` | Override conf-store URI (standalone e2e tests only; serving auto-derives from HCCL host). |
+| `VLLM_ASCEND_ZB_SHMEM_PORT_OFFSET` | Added to HCCL rendezvous port for SHMEM conf-store (default `10000`). |
+| `VLLM_ASCEND_ZB_DEBUG` | Set to `1` to print aclshmem init diagnostics from `zb_runtime.cpp`. |
 
 See also [Environment Variables](../configuration/env_vars.md) for the full list pulled from
 `vllm_ascend/envs.py`.

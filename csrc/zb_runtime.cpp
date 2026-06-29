@@ -78,7 +78,8 @@ int32_t fill_init_attr(int32_t rank, int32_t world_size, uint64_t local_mem_size
 
 bool zb_debug_enabled()
 {
-    return false;
+    const char *value = std::getenv("VLLM_ASCEND_ZB_DEBUG");
+    return value != nullptr && value[0] != '\0' && value[0] != '0';
 }
 
 int32_t query_aclrt_device_or_neg1()
