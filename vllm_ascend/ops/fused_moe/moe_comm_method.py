@@ -23,7 +23,7 @@ from vllm.model_executor.layers.fused_moe import FusedMoEConfig
 
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX, MoECommType
-from vllm_ascend.ops.fused_moe.moe_mlp import unified_apply_mlp
+from vllm_ascend.ops.fused_moe.moe_mlp import unified_apply_mlp, zb_apply_mlp
 from vllm_ascend.ops.fused_moe.moe_runtime_args import (
     MoEFusedExpertsInput,
     MoEMlpComputeInput,
@@ -178,6 +178,8 @@ class MoECommMethod(ABC):
         )
 
     def _apply_mlp(self, mlp_compute_input: MoEMlpComputeInput) -> torch.Tensor:
+        if mlp_compute_input.gmm2_out is not None:
+            return zb_apply_mlp(mlp_compute_input=mlp_compute_input)
         return unified_apply_mlp(mlp_compute_input=mlp_compute_input)
 
     @abstractmethod
