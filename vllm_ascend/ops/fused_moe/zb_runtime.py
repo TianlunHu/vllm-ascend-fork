@@ -83,12 +83,14 @@ def compute_low_latency_max_recv_tokens(
     ep_world_size: int,
     num_local_experts: int,
     *,
+    experts_per_token: int,
     max_tokens_per_rank: int | None = None,
     min_recv_tokens: int = 1024,
 ) -> int:
-    """Mirror deepep_standalone's low-latency max_recv_tokens sizing."""
+    """Mirror deepep_standalone's low-latency max_recv_tokens sizing, aligned with MC2 tiling."""
     per_rank = max(num_tokens_per_rank, max_tokens_per_rank or 0)
-    calculated = per_rank * ep_world_size * num_local_experts
+    global_bs = per_rank * ep_world_size
+    calculated = global_bs * min(num_local_experts, experts_per_token)
     return max(calculated, min_recv_tokens)
 
 
@@ -153,6 +155,7 @@ def estimate_zb_early_local_mem_size(
     ep_world_size: int,
     hidden_size: int,
     moe_expert_num: int,
+    experts_per_token: int,
     use_quant: bool = False,
 ) -> tuple[int, int]:
     """Conservative aclshmem pool sizing for early (startup) init.
@@ -168,6 +171,7 @@ def estimate_zb_early_local_mem_size(
         num_tokens_per_rank=max_tokens_per_rank,
         ep_world_size=ep_world_size,
         num_local_experts=num_local_experts,
+        experts_per_token=experts_per_token,
     )
     local_mem_size = estimate_local_mem_size(
         max_recv_tokens,

@@ -27,7 +27,6 @@ import torch
 import torch_npu
 from vllm.config import get_current_vllm_config
 from vllm.distributed.parallel_state import get_ep_group
-
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.distributed.parallel_state import get_mc2_group
@@ -432,11 +431,13 @@ class TokenDispatcherWithZB(TokenDispatcherWithMC2):
             )
 
         # Non-quant sizing is larger (separate combine_x + expand_x_out buffers).
+        experts_per_token = int(getattr(self._moe_config, "experts_per_token", 0) or 0)
         local_mem_size, _ = estimate_zb_early_local_mem_size(
             max_tokens_per_rank=self._zb_max_tokens_per_rank,
             ep_world_size=self.ep_world_size,
             hidden_size=hidden_size,
             moe_expert_num=moe_expert_num,
+            experts_per_token=experts_per_token,
             use_quant=False,
         )
         uri = resolve_zb_shmem_uri()
@@ -484,11 +485,13 @@ class TokenDispatcherWithZB(TokenDispatcherWithMC2):
                 f"ep_world_size={self.ep_world_size}."
             )
         num_local_experts = moe_expert_num // self.ep_world_size
+        experts_per_token = int(getattr(self._moe_config, "experts_per_token", 0) or 0)
 
         max_recv_tokens = compute_low_latency_max_recv_tokens(
             num_tokens_per_rank=self._zb_max_tokens_per_rank,
             ep_world_size=self.ep_world_size,
             num_local_experts=num_local_experts,
+            experts_per_token=experts_per_token,
         )
         local_mem_size = estimate_local_mem_size(
             max_recv_tokens,
