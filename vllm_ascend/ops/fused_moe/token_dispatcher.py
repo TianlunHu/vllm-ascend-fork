@@ -363,11 +363,11 @@ class TokenDispatcherWithZB(TokenDispatcherWithMC2):
         vllm_config = get_current_vllm_config()
         self._zb_max_tokens_per_rank = _num_tokens_per_tp_rank(vllm_config)
         self._validate_zb_compat()
+        self._zb_runtime = None
+        self._zb_early_local_mem_size = None
         self._ensure_zb_runtime_init()
         # SHMEM process runtime is process-wide; per-dispatcher tensor/aux buffers
         # are populated lazily on first token_dispatch.
-        self._zb_runtime = None
-        self._zb_early_local_mem_size: int | None = None
         self._zb_bundle = None
         self._zb_aux = None
         self._zb_hidden = None
@@ -407,31 +407,39 @@ class TokenDispatcherWithZB(TokenDispatcherWithMC2):
         return moe_expert_num
 
     def _ensure_zb_runtime_init(self) -> None:
-        """Early init: aclshmemx_init_attr once per process (aligned with MC2 HCCL init)."""
+        """Attach to process-wide aclshmem runtime (inited at worker startup)."""
         from vllm_ascend.ops.fused_moe.zb_runtime import (
-            ensure_zb_process_initialized,
             estimate_zb_early_local_mem_size,
             get_zb_process_runtime,
-            resolve_zb_shmem_uri,
+            init_zb_shmem_at_worker_startup,
+            resolve_zb_experts_per_token,
+            resolve_zb_moe_expert_num,
         )
 
         existing = get_zb_process_runtime()
-        if existing is not None:
-            self._zb_runtime = existing
-            self._zb_early_local_mem_size = existing.local_mem_size
-            return
+        if existing is None:
+            # Offline/e2e paths that skip NPUWorker bootstrap.
+            init_zb_shmem_at_worker_startup(get_current_vllm_config())
+            existing = get_zb_process_runtime()
+        if existing is None:
+            raise RuntimeError(
+                "additional_config.enable_mc2_zb=true but ZB SHMEM runtime is not initialized."
+            )
 
         vllm_config = get_current_vllm_config()
-        hidden_size = int(vllm_config.model_config.get_hidden_size())
         moe_expert_num = self._resolve_zb_moe_expert_num()
+        if moe_expert_num <= 0:
+            moe_expert_num = resolve_zb_moe_expert_num(vllm_config)
         if moe_expert_num <= 0:
             raise RuntimeError(
                 "additional_config.enable_mc2_zb=true but moe_expert_num is unknown at "
                 "dispatcher init; pass moe_config with num_experts to TokenDispatcherWithZB."
             )
 
-        # Non-quant sizing is larger (separate combine_x + expand_x_out buffers).
         experts_per_token = int(getattr(self._moe_config, "experts_per_token", 0) or 0)
+        if experts_per_token <= 0:
+            experts_per_token = resolve_zb_experts_per_token(vllm_config)
+        hidden_size = int(vllm_config.model_config.get_hidden_size())
         local_mem_size, _ = estimate_zb_early_local_mem_size(
             max_tokens_per_rank=self._zb_max_tokens_per_rank,
             ep_world_size=self.ep_world_size,
@@ -440,14 +448,7 @@ class TokenDispatcherWithZB(TokenDispatcherWithMC2):
             experts_per_token=experts_per_token,
             use_quant=False,
         )
-        uri = resolve_zb_shmem_uri()
-        runtime = ensure_zb_process_initialized(
-            rank=self.ep_rank_id,
-            world_size=self.ep_world_size,
-            local_mem_size=local_mem_size,
-            server_ip_port=uri,
-        )
-        self._zb_runtime = runtime
+        self._zb_runtime = existing
         self._zb_early_local_mem_size = local_mem_size
 
     def _ensure_zb_buffers(

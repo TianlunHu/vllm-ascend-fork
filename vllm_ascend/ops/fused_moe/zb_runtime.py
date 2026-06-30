@@ -248,6 +248,75 @@ def reserve_zb_shmem_conf_store_uri(hccl_init_method: str) -> str:
     return uri
 
 
+def resolve_zb_moe_expert_num(vllm_config) -> int:
+    hf_config = getattr(vllm_config.model_config, "hf_config", None)
+    if hf_config is not None:
+        return int(getattr(hf_config, "num_experts", 0) or 0)
+    return 0
+
+
+def resolve_zb_experts_per_token(vllm_config) -> int:
+    hf_config = getattr(vllm_config.model_config, "hf_config", None)
+    if hf_config is not None:
+        for attr in ("num_experts_per_tok", "moe_topk", "top_k"):
+            top_k = int(getattr(hf_config, attr, 0) or 0)
+            if top_k > 0:
+                return top_k
+    return 1
+
+
+def _num_tokens_per_tp_rank_for_zb(vllm_config) -> int:
+    scheduler_config = vllm_config.scheduler_config
+    compilation_config = vllm_config.compilation_config
+    speculative_config = vllm_config.speculative_config
+    tp_size = vllm_config.parallel_config.tensor_parallel_size
+    uniform_decode_query_len = 1 if not speculative_config else 1 + speculative_config.num_speculative_tokens
+    decode_max_num_seqs = getattr(scheduler_config, "decode_max_num_seqs", 0)
+    max_num_reqs = max(scheduler_config.max_num_seqs, decode_max_num_seqs)
+    if compilation_config.cudagraph_capture_sizes:
+        max_num_tokens = compilation_config.max_cudagraph_capture_size
+    else:
+        max_num_tokens = min(max_num_reqs * uniform_decode_query_len, 512)
+    return (max_num_tokens + tp_size - 1) // tp_size
+
+
+def init_zb_shmem_at_worker_startup(vllm_config) -> None:
+    """Init aclshmem at worker bootstrap after HCCL/EP groups are ready.
+
+    Under DP>1, multiple EngineCore processes load the model at different times.
+    aclshmem requires every EP rank to enter init together, so this must not
+    wait until ``load_model`` constructs the first MoE dispatcher.
+    """
+    if get_zb_process_runtime() is not None:
+        return
+
+    from vllm_ascend.distributed.parallel_state import get_mc2_group
+
+    mc2 = get_mc2_group()
+    hidden_size = int(vllm_config.model_config.get_hidden_size())
+    moe_expert_num = resolve_zb_moe_expert_num(vllm_config)
+    if moe_expert_num <= 0:
+        raise RuntimeError(
+            "additional_config.enable_mc2_zb=true but moe_expert_num is unknown at "
+            "worker startup; check model hf_config.num_experts."
+        )
+
+    local_mem_size, _ = estimate_zb_early_local_mem_size(
+        max_tokens_per_rank=_num_tokens_per_tp_rank_for_zb(vllm_config),
+        ep_world_size=mc2.world_size,
+        hidden_size=hidden_size,
+        moe_expert_num=moe_expert_num,
+        experts_per_token=resolve_zb_experts_per_token(vllm_config),
+        use_quant=False,
+    )
+    ensure_zb_process_initialized(
+        rank=mc2.rank_in_group,
+        world_size=mc2.world_size,
+        local_mem_size=local_mem_size,
+        server_ip_port=resolve_zb_shmem_uri(),
+    )
+
+
 def resolve_zb_shmem_uri() -> str:
     """Resolve aclshmem conf-store URI for this worker.
 
