@@ -1015,13 +1015,9 @@ class NPUWorker(WorkerBase):
         )
         init_ascend_model_parallel(self.parallel_config)
         if get_ascend_config().enable_mc2_zb:
-            from vllm_ascend.ops.fused_moe.zb_runtime import (
-                init_zb_shmem_at_worker_startup,
-                reserve_zb_shmem_conf_store_uri,
-            )
+            from vllm_ascend.ops.fused_moe.zb_runtime import reserve_zb_shmem_conf_store_uri
 
             reserve_zb_shmem_conf_store_uri(self.distributed_init_method)
-            init_zb_shmem_at_worker_startup(self.vllm_config)
         ensure_ec_transfer_initialized(self.vllm_config)
 
     def get_supported_pooling_tasks(self):
