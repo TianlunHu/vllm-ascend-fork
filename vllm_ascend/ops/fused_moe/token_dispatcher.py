@@ -396,15 +396,13 @@ class TokenDispatcherWithZB(TokenDispatcherWithMC2):
             )
 
     def _resolve_zb_moe_expert_num(self) -> int:
-        moe_expert_num = 0
         if self._moe_config is not None:
             moe_expert_num = int(getattr(self._moe_config, "num_experts", 0) or 0)
-        if moe_expert_num <= 0:
-            vllm_config = get_current_vllm_config()
-            hf_config = getattr(vllm_config.model_config, "hf_config", None)
-            if hf_config is not None:
-                moe_expert_num = int(getattr(hf_config, "num_experts", 0) or 0)
-        return moe_expert_num
+            if moe_expert_num > 0:
+                return moe_expert_num
+        from vllm_ascend.ops.fused_moe.zb_runtime import resolve_zb_moe_expert_num
+
+        return resolve_zb_moe_expert_num(get_current_vllm_config())
 
     def _ensure_zb_runtime_init(self) -> None:
         """Attach to process-wide aclshmem runtime (inited at worker startup)."""

@@ -248,18 +248,34 @@ def reserve_zb_shmem_conf_store_uri(hccl_init_method: str) -> str:
     return uri
 
 
+def _iter_zb_hf_configs(vllm_config):
+    model_config = vllm_config.model_config
+    for cfg in (
+        getattr(model_config, "hf_text_config", None),
+        getattr(model_config, "hf_config", None),
+    ):
+        if cfg is not None:
+            yield cfg
+
+
 def resolve_zb_moe_expert_num(vllm_config) -> int:
-    hf_config = getattr(vllm_config.model_config, "hf_config", None)
-    if hf_config is not None:
-        return int(getattr(hf_config, "num_experts", 0) or 0)
+    get_num_experts = getattr(vllm_config.model_config, "get_num_experts", None)
+    if callable(get_num_experts):
+        num_experts = int(get_num_experts() or 0)
+        if num_experts > 0:
+            return num_experts
+
+    for cfg in _iter_zb_hf_configs(vllm_config):
+        num_experts = int(getattr(cfg, "num_experts", 0) or 0)
+        if num_experts > 0:
+            return num_experts
     return 0
 
 
 def resolve_zb_experts_per_token(vllm_config) -> int:
-    hf_config = getattr(vllm_config.model_config, "hf_config", None)
-    if hf_config is not None:
+    for cfg in _iter_zb_hf_configs(vllm_config):
         for attr in ("num_experts_per_tok", "moe_topk", "top_k"):
-            top_k = int(getattr(hf_config, attr, 0) or 0)
+            top_k = int(getattr(cfg, attr, 0) or 0)
             if top_k > 0:
                 return top_k
     return 1
@@ -298,7 +314,7 @@ def init_zb_shmem_at_worker_startup(vllm_config) -> None:
     if moe_expert_num <= 0:
         raise RuntimeError(
             "additional_config.enable_mc2_zb=true but moe_expert_num is unknown at "
-            "worker startup; check model hf_config.num_experts."
+            "worker startup; check model_config.get_num_experts() or hf_text_config.num_experts."
         )
 
     local_mem_size, _ = estimate_zb_early_local_mem_size(
