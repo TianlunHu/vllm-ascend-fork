@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import os
+
 import pytest
 
 from vllm_ascend.ops.fused_moe import zb_runtime
@@ -44,31 +46,70 @@ class TestParseTcpHostPort:
         assert zb_runtime._parse_tcp_host_port("tcp://[::1]:29500") == ("::1", 29500)
 
 
-class TestZbPhysicalDeviceMapping:
-    def test_resolve_without_visible_devices(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.delenv("ASCEND_RT_VISIBLE_DEVICES", raising=False)
-
-        class FakeNpu:
-            @staticmethod
-            def current_device() -> int:
-                return 1
-
-        monkeypatch.setitem(__import__("sys").modules, "torch_npu", type("torch_npu", (), {"npu": FakeNpu})())
-
-        assert zb_runtime._resolve_zb_physical_device_id() == 1
-
-    def test_resolve_with_visible_devices(self, monkeypatch: pytest.MonkeyPatch) -> None:
+class TestPrepareZbVisibleDevices:
+    def test_skips_when_zb_disabled(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("ASCEND_RT_VISIBLE_DEVICES", "2,3")
 
+        class FakeConfig:
+            enable_mc2_zb = False
+
+        monkeypatch.setattr(zb_runtime, "get_ascend_config", lambda: FakeConfig())
+
+        class ParallelConfig:
+            data_parallel_size = 2
+            data_parallel_index = 1
+            tensor_parallel_size = 2
+            pipeline_parallel_size = 1
+            prefill_context_parallel_size = 1
+            nnodes_within_dp = 1
+
+        zb_runtime.prepare_zb_visible_devices_before_set_device(ParallelConfig(), local_rank=0)
+        assert os.getenv("ASCEND_RT_VISIBLE_DEVICES") == "2,3"
+
+    def test_expands_before_set_device(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("ASCEND_RT_VISIBLE_DEVICES", "2,3")
+
+        class FakeConfig:
+            enable_mc2_zb = True
+
+        monkeypatch.setattr(zb_runtime, "get_ascend_config", lambda: FakeConfig())
+
+        class ParallelConfig:
+            data_parallel_size = 2
+            data_parallel_index = 1
+            tensor_parallel_size = 2
+            pipeline_parallel_size = 1
+            prefill_context_parallel_size = 1
+            nnodes_within_dp = 1
+
+        zb_runtime.prepare_zb_visible_devices_before_set_device(ParallelConfig(), local_rank=0)
+        assert os.getenv("ASCEND_RT_VISIBLE_DEVICES") == "0,1,2,3"
+
+
+class TestConfigureZbNpuDevice:
+    def test_rebinds_physical_device_for_dp_gt1(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        class FakeConfig:
+            enable_mc2_zb = True
+
+        monkeypatch.setattr(zb_runtime, "get_ascend_config", lambda: FakeConfig())
+
         class FakeNpu:
+            last_device = None
+
             @staticmethod
-            def current_device() -> int:
-                return 0
+            def set_device(device_id: int) -> None:
+                FakeNpu.last_device = device_id
 
         monkeypatch.setitem(__import__("sys").modules, "torch_npu", type("torch_npu", (), {"npu": FakeNpu})())
 
-        assert zb_runtime._resolve_zb_physical_device_id() == 2
+        class ParallelConfig:
+            data_parallel_size = 2
+            data_parallel_index = 1
+            tensor_parallel_size = 2
+            pipeline_parallel_size = 1
+            prefill_context_parallel_size = 1
+            nnodes_within_dp = 1
 
-    def test_align_skips_single_rank(self) -> None:
-        zb_runtime._align_zb_shmem_device_visibility(1)
+        zb_runtime.configure_zb_npu_device_after_set_device(ParallelConfig(), local_rank=0)
+        assert FakeNpu.last_device == 2
 

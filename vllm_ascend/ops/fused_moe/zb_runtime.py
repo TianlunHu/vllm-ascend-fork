@@ -319,63 +319,83 @@ def _synchronize_zb_init_peers() -> None:
         pass
 
 
-def _resolve_zb_physical_device_id() -> int:
-    """Map the current logical NPU index to a physical chip id."""
-    import torch_npu
-
-    logical = torch_npu.npu.current_device()
-    visible = os.getenv("ASCEND_RT_VISIBLE_DEVICES", "")
-    if not visible.strip():
-        return logical
-    devices = [int(x.strip()) for x in visible.split(",") if x.strip()]
-    if logical < 0 or logical >= len(devices):
-        return logical
-    return devices[logical]
+def _zb_replica_size(parallel_config) -> int:
+    return (
+        parallel_config.tensor_parallel_size
+        * parallel_config.pipeline_parallel_size
+        * parallel_config.prefill_context_parallel_size
+    )
 
 
-def _align_zb_shmem_device_visibility(world_size: int) -> None:
-    """Expand device visibility so aclshmem/hybm P2P sees unique user device ids.
+def prepare_zb_visible_devices_before_set_device(
+    parallel_config,
+    *,
+    local_rank: int,
+) -> None:
+    """Expand ``ASCEND_RT_VISIBLE_DEVICES`` before the first ``torch.npu.set_device``.
 
-    vLLM DP>1 assigns per-engine ``ASCEND_RT_VISIBLE_DEVICES`` slices (e.g.
-    DP0: ``0,1`` / DP1: ``2,3``). aclshmem init captures ``aclrtGetDevice()``,
-    so two EP ranks report logical 0 and two report logical 1. hybm then tries
-    ``EnablePeerAccess(device, device)`` and ``aclshmemx_init_attr`` fails.
+    Must run before worker ``set_device(local_rank)``. CANN locks visibility at
+    the first device bind; changing the env later (e.g. at aclshmem init) has no
+    effect.
     """
-    if world_size <= 1:
+    if not get_ascend_config().enable_mc2_zb:
+        return
+    if parallel_config.data_parallel_size <= 1:
         return
 
-    try:
-        from vllm_ascend.distributed.parallel_state import get_mc2_group
-    except AssertionError:
+    replica_size = _zb_replica_size(parallel_config)
+    ep_world_size = parallel_config.data_parallel_size * replica_size
+    if ep_world_size <= 1:
         return
 
-    mc2 = get_mc2_group()
-    if mc2.world_size <= 1:
-        return
+    if parallel_config.nnodes_within_dp > 1:
+        raise RuntimeError(
+            "additional_config.enable_mc2_zb=true with data_parallel_size>1 is only "
+            "supported on a single node today. Multi-node DP requires rank-table "
+            "based device mapping for aclshmem P2P."
+        )
 
-    import torch_npu
-
-    physical_id = _resolve_zb_physical_device_id()
-    local = torch.tensor([physical_id], dtype=torch.int64, device="cpu")
-    gathered = [torch.zeros(1, dtype=torch.int64, device="cpu") for _ in range(mc2.world_size)]
-    torch.distributed.all_gather(gathered, local, group=mc2.cpu_group)
-    physical_ids = sorted({int(x.item()) for x in gathered})
-
-    new_visible = ",".join(str(x) for x in physical_ids)
+    new_visible = ",".join(str(i) for i in range(ep_world_size))
     old_visible = os.getenv("ASCEND_RT_VISIBLE_DEVICES", "")
     if new_visible == old_visible:
         return
 
-    device_index = physical_ids.index(physical_id)
     os.environ["ASCEND_RT_VISIBLE_DEVICES"] = new_visible
-    torch_npu.npu.set_device(device_index)
     logger.info(
-        "Expanded ASCEND_RT_VISIBLE_DEVICES for ZB aclshmem "
-        "(old=%r, new=%r, physical_id=%s, device_index=%s)",
+        "ZB: expanded ASCEND_RT_VISIBLE_DEVICES before set_device (old=%r, new=%r)",
         old_visible or None,
         new_visible,
+    )
+
+
+def configure_zb_npu_device_after_set_device(
+    parallel_config,
+    *,
+    local_rank: int,
+) -> None:
+    """Bind the EP-team physical NPU after worker ``set_device(local_rank)``.
+
+    Worker startup keeps the original ``local_rank`` device index. For DP>1 ZB,
+    aclshmem/hybm needs globally unique user device ids, so re-bind to the physical
+    chip once visibility has been expanded.
+    """
+    if not get_ascend_config().enable_mc2_zb:
+        return
+    if parallel_config.data_parallel_size <= 1:
+        return
+
+    import torch_npu
+
+    replica_size = _zb_replica_size(parallel_config)
+    physical_id = parallel_config.data_parallel_index * replica_size + (local_rank % replica_size)
+    if physical_id == local_rank:
+        return
+
+    torch_npu.npu.set_device(physical_id)
+    logger.info(
+        "ZB: rebound NPU device after set_device(local_rank=%s) -> physical_id=%s",
+        local_rank,
         physical_id,
-        device_index,
     )
 
 
@@ -409,7 +429,6 @@ def ensure_zb_process_initialized(
         local_mem_size=local_mem_size,
     )
     _synchronize_zb_init_peers()
-    _align_zb_shmem_device_visibility(world_size)
     try:
         runtime.init()
     except RuntimeError as exc:

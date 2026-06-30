@@ -395,8 +395,25 @@ class NPUWorker(WorkerBase):
         self.cache_config.num_cpu_blocks = num_cpu_blocks
 
     def _init_device(self):
+        if get_ascend_config().enable_mc2_zb:
+            from vllm_ascend.ops.fused_moe.zb_runtime import (
+                configure_zb_npu_device_after_set_device,
+                prepare_zb_visible_devices_before_set_device,
+            )
+
+            prepare_zb_visible_devices_before_set_device(
+                self.parallel_config,
+                local_rank=self.local_rank,
+            )
+
         device = torch.device(f"npu:{self.local_rank}")
         torch.npu.set_device(device)
+
+        if get_ascend_config().enable_mc2_zb:
+            configure_zb_npu_device_after_set_device(
+                self.parallel_config,
+                local_rank=self.local_rank,
+            )
 
         # Import _inductor for graph mode execution with triton
         # This lazy import avoids torch_npu re-initialization in patch
