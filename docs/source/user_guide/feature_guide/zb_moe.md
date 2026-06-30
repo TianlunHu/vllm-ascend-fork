@@ -87,7 +87,9 @@ vllm serve <moe-model> \
 ## Limitations (current)
 
 - **Hardware:** A3/A5 only (requires MC2 extra-args path).
-- **DP:** DP=1 only for the ZB serving path.
+- **DP:** Single-node `data_parallel_size>1` is supported when `enable_mc2_zb=true`
+  (worker startup expands ``ASCEND_RT_VISIBLE_DEVICES`` and binds the EP physical
+  NPU before aclshmem init). Multi-node DP is not supported yet.
 - **Incompatible with** `enable_mc2_hierarchy_comm` in Ascend config.
 - **MXFP** gmm2 direct-to-`combine_x` is not supported yet.
 

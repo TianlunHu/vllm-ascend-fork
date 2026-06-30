@@ -397,23 +397,19 @@ class NPUWorker(WorkerBase):
     def _init_device(self):
         if get_ascend_config().enable_mc2_zb:
             from vllm_ascend.ops.fused_moe.zb_runtime import (
-                configure_zb_npu_device_after_set_device,
                 prepare_zb_visible_devices_before_set_device,
+                resolve_zb_worker_device_index,
             )
 
-            prepare_zb_visible_devices_before_set_device(
-                self.parallel_config,
-                local_rank=self.local_rank,
-            )
+            prepare_zb_visible_devices_before_set_device(self.parallel_config)
 
-        device = torch.device(f"npu:{self.local_rank}")
+        device_index = (
+            resolve_zb_worker_device_index(self.parallel_config, self.local_rank)
+            if get_ascend_config().enable_mc2_zb
+            else self.local_rank
+        )
+        device = torch.device(f"npu:{device_index}")
         torch.npu.set_device(device)
-
-        if get_ascend_config().enable_mc2_zb:
-            configure_zb_npu_device_after_set_device(
-                self.parallel_config,
-                local_rank=self.local_rank,
-            )
 
         # Import _inductor for graph mode execution with triton
         # This lazy import avoids torch_npu re-initialization in patch
@@ -428,7 +424,7 @@ class NPUWorker(WorkerBase):
         torch.npu.empty_cache()
 
         if get_ascend_device_type() == AscendDeviceType.A5:
-            setup_ascend_local_comm_res(self.local_rank, self.vllm_config.kv_transfer_config)
+            setup_ascend_local_comm_res(device_index, self.vllm_config.kv_transfer_config)
 
         # take current memory snapshot
         self.init_snapshot = MemorySnapshot()

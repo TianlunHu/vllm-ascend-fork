@@ -46,10 +46,8 @@ class TestParseTcpHostPort:
         assert zb_runtime._parse_tcp_host_port("tcp://[::1]:29500") == ("::1", 29500)
 
 
-class TestPrepareZbVisibleDevices:
-    def test_skips_when_zb_disabled(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setenv("ASCEND_RT_VISIBLE_DEVICES", "2,3")
-
+class TestZbWorkerDeviceIndex:
+    def test_resolve_keeps_local_rank_without_zb(self, monkeypatch: pytest.MonkeyPatch) -> None:
         class FakeConfig:
             enable_mc2_zb = False
 
@@ -61,12 +59,10 @@ class TestPrepareZbVisibleDevices:
             tensor_parallel_size = 2
             pipeline_parallel_size = 1
             prefill_context_parallel_size = 1
-            nnodes_within_dp = 1
 
-        zb_runtime.prepare_zb_visible_devices_before_set_device(ParallelConfig(), local_rank=0)
-        assert os.getenv("ASCEND_RT_VISIBLE_DEVICES") == "2,3"
+        assert zb_runtime.resolve_zb_worker_device_index(ParallelConfig(), local_rank=0) == 0
 
-    def test_expands_before_set_device(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_prepare_expands_visible_devices(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("ASCEND_RT_VISIBLE_DEVICES", "2,3")
 
         class FakeConfig:
@@ -82,25 +78,14 @@ class TestPrepareZbVisibleDevices:
             prefill_context_parallel_size = 1
             nnodes_within_dp = 1
 
-        zb_runtime.prepare_zb_visible_devices_before_set_device(ParallelConfig(), local_rank=0)
+        zb_runtime.prepare_zb_visible_devices_before_set_device(ParallelConfig())
         assert os.getenv("ASCEND_RT_VISIBLE_DEVICES") == "0,1,2,3"
 
-
-class TestConfigureZbNpuDevice:
-    def test_rebinds_physical_device_for_dp_gt1(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_resolve_uses_physical_index_for_dp_gt1(self, monkeypatch: pytest.MonkeyPatch) -> None:
         class FakeConfig:
             enable_mc2_zb = True
 
         monkeypatch.setattr(zb_runtime, "get_ascend_config", lambda: FakeConfig())
-
-        class FakeNpu:
-            last_device = None
-
-            @staticmethod
-            def set_device(device_id: int) -> None:
-                FakeNpu.last_device = device_id
-
-        monkeypatch.setitem(__import__("sys").modules, "torch_npu", type("torch_npu", (), {"npu": FakeNpu})())
 
         class ParallelConfig:
             data_parallel_size = 2
@@ -110,6 +95,6 @@ class TestConfigureZbNpuDevice:
             prefill_context_parallel_size = 1
             nnodes_within_dp = 1
 
-        zb_runtime.configure_zb_npu_device_after_set_device(ParallelConfig(), local_rank=0)
-        assert FakeNpu.last_device == 2
+        assert zb_runtime.resolve_zb_worker_device_index(ParallelConfig(), local_rank=0) == 2
+        assert zb_runtime.resolve_zb_worker_device_index(ParallelConfig(), local_rank=1) == 3
 
