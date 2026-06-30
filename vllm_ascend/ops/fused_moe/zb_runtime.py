@@ -319,6 +319,66 @@ def _synchronize_zb_init_peers() -> None:
         pass
 
 
+def _resolve_zb_physical_device_id() -> int:
+    """Map the current logical NPU index to a physical chip id."""
+    import torch_npu
+
+    logical = torch_npu.npu.current_device()
+    visible = os.getenv("ASCEND_RT_VISIBLE_DEVICES", "")
+    if not visible.strip():
+        return logical
+    devices = [int(x.strip()) for x in visible.split(",") if x.strip()]
+    if logical < 0 or logical >= len(devices):
+        return logical
+    return devices[logical]
+
+
+def _align_zb_shmem_device_visibility(world_size: int) -> None:
+    """Expand device visibility so aclshmem/hybm P2P sees unique user device ids.
+
+    vLLM DP>1 assigns per-engine ``ASCEND_RT_VISIBLE_DEVICES`` slices (e.g.
+    DP0: ``0,1`` / DP1: ``2,3``). aclshmem init captures ``aclrtGetDevice()``,
+    so two EP ranks report logical 0 and two report logical 1. hybm then tries
+    ``EnablePeerAccess(device, device)`` and ``aclshmemx_init_attr`` fails.
+    """
+    if world_size <= 1:
+        return
+
+    try:
+        from vllm_ascend.distributed.parallel_state import get_mc2_group
+    except AssertionError:
+        return
+
+    mc2 = get_mc2_group()
+    if mc2.world_size <= 1:
+        return
+
+    import torch_npu
+
+    physical_id = _resolve_zb_physical_device_id()
+    local = torch.tensor([physical_id], dtype=torch.int64, device="cpu")
+    gathered = [torch.zeros(1, dtype=torch.int64, device="cpu") for _ in range(mc2.world_size)]
+    torch.distributed.all_gather(gathered, local, group=mc2.cpu_group)
+    physical_ids = sorted({int(x.item()) for x in gathered})
+
+    new_visible = ",".join(str(x) for x in physical_ids)
+    old_visible = os.getenv("ASCEND_RT_VISIBLE_DEVICES", "")
+    if new_visible == old_visible:
+        return
+
+    device_index = physical_ids.index(physical_id)
+    os.environ["ASCEND_RT_VISIBLE_DEVICES"] = new_visible
+    torch_npu.npu.set_device(device_index)
+    logger.info(
+        "Expanded ASCEND_RT_VISIBLE_DEVICES for ZB aclshmem "
+        "(old=%r, new=%r, physical_id=%s, device_index=%s)",
+        old_visible or None,
+        new_visible,
+        physical_id,
+        device_index,
+    )
+
+
 def ensure_zb_process_initialized(
     rank: int,
     world_size: int,
@@ -349,6 +409,7 @@ def ensure_zb_process_initialized(
         local_mem_size=local_mem_size,
     )
     _synchronize_zb_init_peers()
+    _align_zb_shmem_device_visibility(world_size)
     try:
         runtime.init()
     except RuntimeError as exc:

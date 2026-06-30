@@ -42,3 +42,33 @@ class TestParseTcpHostPort:
 
     def test_ipv6(self) -> None:
         assert zb_runtime._parse_tcp_host_port("tcp://[::1]:29500") == ("::1", 29500)
+
+
+class TestZbPhysicalDeviceMapping:
+    def test_resolve_without_visible_devices(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("ASCEND_RT_VISIBLE_DEVICES", raising=False)
+
+        class FakeNpu:
+            @staticmethod
+            def current_device() -> int:
+                return 1
+
+        monkeypatch.setitem(__import__("sys").modules, "torch_npu", type("torch_npu", (), {"npu": FakeNpu})())
+
+        assert zb_runtime._resolve_zb_physical_device_id() == 1
+
+    def test_resolve_with_visible_devices(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("ASCEND_RT_VISIBLE_DEVICES", "2,3")
+
+        class FakeNpu:
+            @staticmethod
+            def current_device() -> int:
+                return 0
+
+        monkeypatch.setitem(__import__("sys").modules, "torch_npu", type("torch_npu", (), {"npu": FakeNpu})())
+
+        assert zb_runtime._resolve_zb_physical_device_id() == 2
+
+    def test_align_skips_single_rank(self) -> None:
+        zb_runtime._align_zb_shmem_device_visibility(1)
+
