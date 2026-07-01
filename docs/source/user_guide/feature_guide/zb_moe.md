@@ -31,10 +31,16 @@ If SHMEM is detected, ZB custom ops are compiled automatically. No extra build e
 variable is required.
 
 **Data parallel (DP>1):** vLLM keeps per-DP-engine ``ASCEND_RT_VISIBLE_DEVICES`` slices and
-workers use ``torch.npu.set_device(local_rank)``. For ZB init across the full EP team under
-DP>1, use Ascend SHMEM **v1.3.0** with the hybm ``ResolvePeerAccessDeviceId`` patch (logic
-device id fallback when exported user device ids collide). Without that aclshmem fix, shmem
-init fails on DP>1 even though MC2 (HCCL) works.
+workers use ``torch.npu.set_device(local_rank)``. ZB **dispatch/combine still use MTE**
+(``ACLSHMEM_DATA_OP_MTE`` at init and ``NNOPBASE_HCCL_SERVER_TYPE_MTE`` in the custom
+ops); the aclshmem patch does not change the operator data path.
+
+For DP>1, install patched aclshmem **v1.3.0** that skips invalid
+``aclrtDeviceEnablePeerAccess`` calls during **hybm heap import** when exported user
+``deviceId`` collides across EP ranks but ``logicDeviceId`` differs (typical cross-DP
+visible-device slice). Import continues with fabric share-handle ``HalMemImport`` /
+``HalMemMap`` to build the shared heap. Rebuild and install that aclshmem build before
+DP>1 ZB serving.
 
 Verify registration after install:
 
@@ -93,9 +99,9 @@ vllm serve <moe-model> \
 ## Limitations (current)
 
 - **Hardware:** A3/A5 only (requires MC2 extra-args path).
-- **DP:** DP>1 ZB serving is supported when patched aclshmem v1.3.0 is installed (see
-  Build time). Validate on target hardware before production use; set
-  ``VLLM_ASCEND_ZB_DEBUG=1`` if shmem init fails.
+- **DP:** DP>1 ZB serving requires the patched aclshmem v1.3.0 build described under
+  Build time (hybm init only; MTE operator path unchanged). Validate on target hardware
+  before production use; set ``VLLM_ASCEND_ZB_DEBUG=1`` if shmem init fails.
 - **Incompatible with** `enable_mc2_hierarchy_comm` in Ascend config.
 - **MXFP** gmm2 direct-to-`combine_x` is not supported yet.
 
