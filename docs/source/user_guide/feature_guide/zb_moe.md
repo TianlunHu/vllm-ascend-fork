@@ -30,6 +30,12 @@ pip install -e . --no-build-isolation
 If SHMEM is detected, ZB custom ops are compiled automatically. No extra build environment
 variable is required.
 
+**Data parallel (DP>1):** vLLM keeps per-DP-engine ``ASCEND_RT_VISIBLE_DEVICES`` slices and
+workers use ``torch.npu.set_device(local_rank)``. For ZB init across the full EP team under
+DP>1, use Ascend SHMEM **v1.3.0** with the hybm ``ResolvePeerAccessDeviceId`` patch (logic
+device id fallback when exported user device ids collide). Without that aclshmem fix, shmem
+init fails on DP>1 even though MC2 (HCCL) works.
+
 Verify registration after install:
 
 ```bash
@@ -87,9 +93,9 @@ vllm serve <moe-model> \
 ## Limitations (current)
 
 - **Hardware:** A3/A5 only (requires MC2 extra-args path).
-- **DP:** Single-node `data_parallel_size>1` is supported when `enable_mc2_zb=true`
-  (worker startup expands ``ASCEND_RT_VISIBLE_DEVICES`` and binds the EP physical
-  NPU before aclshmem init). Multi-node DP is not supported yet.
+- **DP:** DP>1 ZB serving is supported when patched aclshmem v1.3.0 is installed (see
+  Build time). Validate on target hardware before production use; set
+  ``VLLM_ASCEND_ZB_DEBUG=1`` if shmem init fails.
 - **Incompatible with** `enable_mc2_hierarchy_comm` in Ascend config.
 - **MXFP** gmm2 direct-to-`combine_x` is not supported yet.
 

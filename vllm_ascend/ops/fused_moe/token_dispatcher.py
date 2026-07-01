@@ -385,6 +385,9 @@ class TokenDispatcherWithZB(TokenDispatcherWithMC2):
                 "additional_config.enable_mc2_zb=true is incompatible with enable_mc2_hierarchy_comm; "
                 "disable one of them."
             )
+        from vllm_ascend.ops.fused_moe.zb_runtime import validate_zb_serving_parallel_config
+
+        validate_zb_serving_parallel_config(self._vllm_config.parallel_config)
         enable_custom_op()
         ascend_ops = getattr(torch.ops, "_C_ascend", None)
         if ascend_ops is None or not hasattr(ascend_ops, "zb_moe_distribute_dispatch"):

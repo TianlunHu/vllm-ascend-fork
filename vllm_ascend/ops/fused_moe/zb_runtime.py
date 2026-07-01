@@ -319,76 +319,10 @@ def _synchronize_zb_init_peers() -> None:
         pass
 
 
-def _zb_replica_size(parallel_config) -> int:
-    return (
-        parallel_config.tensor_parallel_size
-        * parallel_config.pipeline_parallel_size
-        * parallel_config.prefill_context_parallel_size
-    )
-
-
-def _zb_ep_world_size(parallel_config) -> int:
-    return parallel_config.data_parallel_size * _zb_replica_size(parallel_config)
-
-
-def zb_needs_ep_team_visibility(parallel_config) -> bool:
-    """True when ZB aclshmem must see all EP-team NPUs in one process."""
+def validate_zb_serving_parallel_config(parallel_config) -> None:
+    """Fail fast when ZB is enabled with unsupported parallel layout."""
     if not get_ascend_config().enable_mc2_zb:
-        return False
-    if parallel_config.data_parallel_size <= 1:
-        return False
-    return _zb_ep_world_size(parallel_config) > 1
-
-
-def zb_physical_device_index(parallel_config, local_rank: int) -> int:
-    replica_size = _zb_replica_size(parallel_config)
-    return parallel_config.data_parallel_index * replica_size + (local_rank % replica_size)
-
-
-def prepare_zb_visible_devices_before_set_device(parallel_config) -> None:
-    """Expand ``ASCEND_RT_VISIBLE_DEVICES`` before the first ``torch.npu.set_device``.
-
-    vLLM DP>1 gives each engine a device slice (DP0: ``0,1`` / DP1: ``2,3``).
-    aclshmem/hybm P2P needs globally unique user device ids across the EP team.
-    CANN only accepts visibility changes before the first device bind.
-    """
-    if not zb_needs_ep_team_visibility(parallel_config):
         return
-
-    if parallel_config.nnodes_within_dp > 1:
-        raise RuntimeError(
-            "additional_config.enable_mc2_zb=true with data_parallel_size>1 is only "
-            "supported on a single node today. Multi-node DP requires rank-table "
-            "based device mapping for aclshmem P2P."
-        )
-
-    new_visible = ",".join(str(i) for i in range(_zb_ep_world_size(parallel_config)))
-    old_visible = os.getenv("ASCEND_RT_VISIBLE_DEVICES", "")
-    if new_visible == old_visible:
-        return
-
-    os.environ["ASCEND_RT_VISIBLE_DEVICES"] = new_visible
-    logger.info(
-        "ZB: expanded ASCEND_RT_VISIBLE_DEVICES before set_device (old=%r, new=%r)",
-        old_visible or None,
-        new_visible,
-    )
-
-
-def resolve_zb_worker_device_index(parallel_config, local_rank: int) -> int:
-    """Return the NPU index passed to ``torch.npu.set_device`` for ZB serving."""
-    if not zb_needs_ep_team_visibility(parallel_config):
-        return local_rank
-
-    physical_id = zb_physical_device_index(parallel_config, local_rank)
-    logger.info(
-        "ZB: worker device index %s (local_rank=%s, dp_index=%s)",
-        physical_id,
-        local_rank,
-        parallel_config.data_parallel_index,
-    )
-    return physical_id
-
 
 def ensure_zb_process_initialized(
     rank: int,
