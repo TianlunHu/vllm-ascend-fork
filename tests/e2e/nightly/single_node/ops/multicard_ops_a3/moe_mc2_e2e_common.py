@@ -9,6 +9,7 @@ import random
 import numpy as np
 import torch
 import torch.distributed as dist
+import torch_npu
 
 
 def mc2_test_mode(env_prefix: str, default: str = "correctness") -> str:
@@ -73,6 +74,32 @@ def mc2_trace_dir(default: str) -> str:
     return os.environ.get(
         "VLLM_ASCEND_MOE_MC2_TEST_TRACE_DIR",
         os.environ.get("VLLM_ASCEND_ZB_TEST_TRACE_DIR", default),
+    )
+
+
+def mc2_bool_env(primary: str, zb_fallback: str) -> bool:
+    for key in (primary, zb_fallback):
+        raw = os.environ.get(key, "").strip().lower()
+        if raw in ("1", "true", "yes", "on"):
+            return True
+        if raw in ("0", "false", "no", "off"):
+            return False
+    return False
+
+
+def mc2_w8a8_enabled() -> bool:
+    return mc2_bool_env("VLLM_ASCEND_MOE_MC2_TEST_W8A8", "VLLM_ASCEND_ZB_TEST_W8A8")
+
+
+def mc2_full_moe_enabled() -> bool:
+    return mc2_bool_env("VLLM_ASCEND_MOE_MC2_TEST_FULL_MOE", "VLLM_ASCEND_ZB_TEST_FULL_MOE")
+
+
+def mc2_intermediate_size() -> int:
+    return mc2_int_env(
+        "VLLM_ASCEND_MOE_MC2_TEST_INTERMEDIATE",
+        "VLLM_ASCEND_ZB_TEST_INTERMEDIATE",
+        "512",
     )
 
 
@@ -190,3 +217,124 @@ def seed_worker(rank: int) -> None:
     random.seed(rank + 42)
     np.random.seed(rank + 42)
     torch.manual_seed(rank + 42)
+
+
+def build_w8a8_expert_weights(
+    num_local_experts: int,
+    hidden: int,
+    intermediate: int,
+    device: str,
+    seed: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Local expert weights for w8a8 dynamic MoE (FRACTAL_NZ int8 + bf16 scales)."""
+    gen = torch.Generator(device="cpu")
+    gen.manual_seed(seed)
+    gmm1_weight = torch.randint(
+        -16,
+        16,
+        (num_local_experts, hidden, intermediate * 2),
+        dtype=torch.int8,
+        generator=gen,
+    )
+    gmm2_weight = torch.randint(
+        -16,
+        16,
+        (num_local_experts, intermediate, hidden),
+        dtype=torch.int8,
+        generator=gen,
+    )
+    gmm1_weight_scale = (torch.rand((num_local_experts, intermediate * 2), generator=gen) * 0.003 + 0.0015).bfloat16()
+    gmm2_weight_scale = (torch.rand((num_local_experts, hidden), generator=gen) * 0.003 + 0.0015).bfloat16()
+
+    gmm1_weight = torch_npu.npu_format_cast(gmm1_weight.npu(device=device), torch_npu.Format.FRACTAL_NZ)
+    gmm2_weight = torch_npu.npu_format_cast(gmm2_weight.npu(device=device), torch_npu.Format.FRACTAL_NZ)
+    gmm1_weight_scale = gmm1_weight_scale.to(device=device)
+    gmm2_weight_scale = gmm2_weight_scale.to(device=device)
+    return gmm1_weight, gmm1_weight_scale, gmm2_weight, gmm2_weight_scale
+
+
+def w8a8_gmm1_swiglu(
+    expand_x: torch.Tensor,
+    gmm1_weight: torch.Tensor,
+    gmm1_weight_scale: torch.Tensor,
+    dynamic_scales: torch.Tensor,
+    expert_token_nums: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    y1_int32 = torch_npu.npu_grouped_matmul(
+        x=[expand_x],
+        weight=[gmm1_weight],
+        split_item=3,
+        group_list_type=1,
+        group_type=0,
+        group_list=expert_token_nums,
+        output_dtype=torch.int32,
+    )[0]
+    return torch_npu.npu_dequant_swiglu_quant(
+        x=y1_int32,
+        weight_scale=gmm1_weight_scale.to(torch.float32),
+        activation_scale=dynamic_scales,
+        bias=None,
+        quant_scale=None,
+        quant_offset=None,
+        group_index=expert_token_nums,
+        activate_left=True,
+        quant_mode=1,
+    )
+
+
+def w8a8_gmm2(
+    y1: torch.Tensor,
+    y1_scale: torch.Tensor,
+    gmm2_weight: torch.Tensor,
+    gmm2_weight_scale: torch.Tensor,
+    expert_token_nums: torch.Tensor,
+    *,
+    output_dtype: torch.dtype = torch.bfloat16,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    if out is None:
+        return torch_npu.npu_grouped_matmul(
+            x=[y1],
+            weight=[gmm2_weight],
+            scale=[gmm2_weight_scale],
+            per_token_scale=[y1_scale],
+            split_item=2,
+            group_list_type=1,
+            group_type=0,
+            group_list=expert_token_nums,
+            output_dtype=output_dtype,
+        )[0]
+    from vllm_ascend.ops.fused_moe.zb_runtime import zb_moe_grouped_matmul_gmm2_out
+
+    zb_moe_grouped_matmul_gmm2_out(
+        y1,
+        [gmm2_weight],
+        expert_token_nums,
+        out,
+        scale=[gmm2_weight_scale],
+        per_token_scale=[y1_scale],
+        split_item=2,
+        group_type=0,
+        group_list_type=1,
+    )
+    return out
+
+
+def verify_tensors_close(
+    actual: torch.Tensor,
+    expected: torch.Tensor,
+    rank: int,
+    *,
+    label: str,
+    atol: float = 5e-2,
+    rtol: float = 5e-2,
+) -> None:
+    actual_np = actual.float().cpu().numpy()
+    expected_np = expected.float().cpu().numpy()
+    passed = np.allclose(actual_np, expected_np, atol=atol, rtol=rtol)
+    abs_diff = float(np.max(np.abs(actual_np - expected_np)))
+    rel_diff = float(np.max(np.abs(actual_np - expected_np) / (np.abs(expected_np) + 1e-12)))
+    assert passed, (
+        f"rank {rank}: {label} mismatch max_abs={abs_diff:.3e} max_rel={rel_diff:.3e} "
+        f"(atol={atol}, rtol={rtol})"
+    )
