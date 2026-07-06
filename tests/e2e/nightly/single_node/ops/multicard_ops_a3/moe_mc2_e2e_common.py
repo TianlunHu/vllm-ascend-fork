@@ -294,12 +294,11 @@ def w8a8_gmm2(
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     group_list = expert_token_nums.to(torch.int64)
-    gmm2_scale = gmm2_weight_scale.to(torch.float32)
     if out is None:
         return torch_npu.npu_grouped_matmul(
             x=[y1],
             weight=[gmm2_weight],
-            scale=[gmm2_scale],
+            scale=[gmm2_weight_scale],
             per_token_scale=[y1_scale],
             split_item=2,
             group_list_type=1,
@@ -319,7 +318,7 @@ def w8a8_gmm2(
         [gmm2_weight],
         group_list,
         out,
-        scale=[gmm2_scale],
+        scale=[gmm2_weight_scale],
         per_token_scale=[y1_scale],
         split_item=2,
         group_type=0,
