@@ -226,6 +226,11 @@ class ZbMoeOpContext:
     def quant_mode(self) -> int:
         return 2 if self.use_w8a8 else 0
 
+    @property
+    def combine_comm_quant_mode(self) -> int:
+        # After gmm2, combine input is bf16 expert output (see test_dispatch_gmm_combine_decode).
+        return 0 if self.full_moe else self.quant_mode
+
     def _zb_combine_ori_x(self) -> torch.Tensor | None:
         if self.full_moe or self.use_w8a8:
             return None
@@ -247,6 +252,7 @@ class ZbMoeOpContext:
             ext_info=self.runtime.ext_info,
             quant_mode=self.quant_mode,
             global_bs=self.global_bs,
+            shared_expert_num=1,
         )
 
     def run_zb_gmm(self) -> None:
@@ -271,7 +277,7 @@ class ZbMoeOpContext:
         )
 
     def run_zb_combine(self) -> None:
-        expand_scales = self.aux["dynamic_scales"] if self.use_w8a8 else None
+        expand_scales = self.aux["dynamic_scales"] if self.combine_comm_quant_mode == 2 else None
         zb_moe_distribute_combine(
             expand_x=self.bundle.combine_x,
             expert_ids=self.topk_idx,
@@ -287,7 +293,7 @@ class ZbMoeOpContext:
             moe_expert_num=self.num_experts,
             ext_info=self.runtime.ext_info,
             global_bs=self.global_bs,
-            comm_quant_mode=self.quant_mode,
+            comm_quant_mode=self.combine_comm_quant_mode,
         )
 
     def run_zb_dispatch_combine(self) -> None:
@@ -311,6 +317,7 @@ class ZbMoeOpContext:
             tp_world_size=1,
             tp_rank_id=0,
             expert_shard_type=0,
+            shared_expert_num=1,
             shared_expert_rank_num=0,
             quant_mode=self.quant_mode,
             global_bs=self.global_bs,
@@ -376,9 +383,10 @@ class ZbMoeOpContext:
             tp_world_size=1,
             tp_rank_id=0,
             expert_shard_type=0,
+            shared_expert_num=1,
             shared_expert_rank_num=0,
             global_bs=self.global_bs,
-            comm_quant_mode=self.quant_mode,
+            comm_quant_mode=self.combine_comm_quant_mode,
         )
 
     def run_pta_dispatch_combine(self) -> None:
@@ -539,13 +547,27 @@ def _worker(rank: int, world_size: int, port: int, results: mp.SimpleQueue) -> N
 
 
 def _run_correctness(ctx: ZbMoeOpContext) -> None:
-    ctx.run_pta_dispatch_combine()
-    torch.npu.synchronize()
-    dist.barrier()
+    def _sync(step: str) -> None:
+        torch.npu.synchronize()
+        dist.barrier()
+        if ctx.rank == 0:
+            print(f"  correctness: {step} OK", flush=True)
 
-    ctx.run_zb_dispatch_combine()
-    torch.npu.synchronize()
-    dist.barrier()
+    ctx.run_pta_dispatch()
+    _sync("PTA dispatch")
+    if ctx.full_moe:
+        ctx.run_pta_gmm()
+        _sync("PTA gmm1+gmm2")
+    ctx.run_pta_combine()
+    _sync("PTA combine")
+
+    ctx.run_zb_dispatch()
+    _sync("ZB dispatch")
+    if ctx.full_moe:
+        ctx.run_zb_gmm()
+        _sync("ZB gmm1+gmm2")
+    ctx.run_zb_combine()
+    _sync("ZB combine")
 
     if ctx.use_w8a8 or ctx.full_moe:
         verify_tensors_close(

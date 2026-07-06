@@ -260,13 +260,14 @@ def w8a8_gmm1_swiglu(
     dynamic_scales: torch.Tensor,
     expert_token_nums: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    group_list = expert_token_nums.to(torch.int32)
     y1_int32 = torch_npu.npu_grouped_matmul(
         x=[expand_x],
         weight=[gmm1_weight],
         split_item=3,
         group_list_type=1,
         group_type=0,
-        group_list=expert_token_nums,
+        group_list=group_list,
         output_dtype=torch.int32,
     )[0]
     return torch_npu.npu_dequant_swiglu_quant(
@@ -276,7 +277,7 @@ def w8a8_gmm1_swiglu(
         bias=None,
         quant_scale=None,
         quant_offset=None,
-        group_index=expert_token_nums,
+        group_index=group_list,
         activate_left=True,
         quant_mode=1,
     )
@@ -292,26 +293,33 @@ def w8a8_gmm2(
     output_dtype: torch.dtype = torch.bfloat16,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
+    group_list = expert_token_nums.to(torch.int32)
+    gmm2_scale = gmm2_weight_scale.to(torch.float32)
     if out is None:
         return torch_npu.npu_grouped_matmul(
             x=[y1],
             weight=[gmm2_weight],
-            scale=[gmm2_weight_scale],
+            scale=[gmm2_scale],
             per_token_scale=[y1_scale],
             split_item=2,
             group_list_type=1,
             group_type=0,
-            group_list=expert_token_nums,
+            group_list=group_list,
             output_dtype=output_dtype,
         )[0]
     from vllm_ascend.ops.fused_moe.zb_runtime import zb_moe_grouped_matmul_gmm2_out
 
+    num_rows = y1.size(0)
+    if num_rows > out.size(0):
+        raise ValueError(
+            f"gmm2 output rows {num_rows} exceed SHMEM combine_x capacity {out.size(0)}"
+        )
     zb_moe_grouped_matmul_gmm2_out(
         y1,
         [gmm2_weight],
-        expert_token_nums,
+        group_list,
         out,
-        scale=[gmm2_weight_scale],
+        scale=[gmm2_scale],
         per_token_scale=[y1_scale],
         split_item=2,
         group_type=0,
