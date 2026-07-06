@@ -174,15 +174,19 @@ def _allocate_aux_tensors(
     num_local_experts: int,
     num_max_tokens: int,
     device: str,
+    *,
+    allocate_dynamic_scales: bool = True,
 ) -> dict:
     max_size = max(num_tokens * num_topk, num_max_tokens * 16)
-    return {
+    aux: dict = {
         "assist_info_for_combine": torch.empty((max_size,), dtype=torch.int32, device=device),
         "expert_token_nums": torch.empty((num_local_experts,), dtype=torch.int64, device=device),
         "ep_recv_count": torch.empty((num_experts * num_ranks,), dtype=torch.int32, device=device),
         "tp_recv_count": torch.empty((1,), dtype=torch.int32, device=device),
-        "dynamic_scales": torch.empty((num_max_tokens,), dtype=torch.float32, device=device),
     }
+    if allocate_dynamic_scales:
+        aux["dynamic_scales"] = torch.empty((num_max_tokens,), dtype=torch.float32, device=device)
+    return aux
 
 
 @dataclass
@@ -236,12 +240,18 @@ class ZbMoeOpContext:
             return None
         return self.bundle.expand_x_out
 
+    def _zb_dynamic_scales(self) -> torch.Tensor:
+        if self.use_w8a8:
+            assert self.bundle.dynamic_scales_out is not None
+            return self.bundle.dynamic_scales_out
+        return self.aux["dynamic_scales"]
+
     def run_zb_dispatch(self) -> None:
         zb_moe_distribute_dispatch(
             x=self.x,
             expert_ids=self.topk_idx,
             expand_x_out=self.bundle.expand_x_out,
-            dynamic_scales_out=self.aux["dynamic_scales"],
+            dynamic_scales_out=self._zb_dynamic_scales(),
             assist_info_for_combine_out=self.aux["assist_info_for_combine"],
             expert_token_nums_out=self.aux["expert_token_nums"],
             ep_recv_count_out=self.aux["ep_recv_count"],
@@ -252,7 +262,6 @@ class ZbMoeOpContext:
             ext_info=self.runtime.ext_info,
             quant_mode=self.quant_mode,
             global_bs=self.global_bs,
-            shared_expert_num=1,
         )
 
     def run_zb_gmm(self) -> None:
@@ -264,7 +273,7 @@ class ZbMoeOpContext:
             expand_x,
             self.gmm1_weight,
             self.gmm1_weight_scale,
-            self.aux["dynamic_scales"],
+            self._zb_dynamic_scales(),
             self.aux["expert_token_nums"],
         )
         w8a8_gmm2(
@@ -277,7 +286,7 @@ class ZbMoeOpContext:
         )
 
     def run_zb_combine(self) -> None:
-        expand_scales = self.aux["dynamic_scales"] if self.combine_comm_quant_mode == 2 else None
+        expand_scales = self._zb_dynamic_scales() if self.combine_comm_quant_mode == 2 else None
         zb_moe_distribute_combine(
             expand_x=self.bundle.combine_x,
             expert_ids=self.topk_idx,
@@ -442,8 +451,20 @@ def _build_context(rank: int, world_size: int) -> ZbMoeOpContext:
         use_quant=use_w8a8,
     )
     aux = _allocate_aux_tensors(
-        num_tokens, num_topk, num_experts, world_size, num_local_experts, num_max_tokens, device
+        num_tokens,
+        num_topk,
+        num_experts,
+        world_size,
+        num_local_experts,
+        num_max_tokens,
+        device,
+        allocate_dynamic_scales=not use_w8a8,
     )
+    if use_w8a8:
+        assert bundle.dynamic_scales_out is not None
+        aux["dynamic_scales"] = bundle.dynamic_scales_out
+    else:
+        aux["dynamic_scales"] = torch.empty((num_max_tokens,), dtype=torch.float32, device=device)
     x, topk_idx, topk_weights = _build_fixed_inputs(num_tokens, hidden, num_topk, num_experts, rank)
     combined_x = torch.empty((num_tokens, hidden), dtype=torch.bfloat16, device=device)
     pta_combined_x = torch.empty((num_tokens, hidden), dtype=torch.bfloat16, device=device)
