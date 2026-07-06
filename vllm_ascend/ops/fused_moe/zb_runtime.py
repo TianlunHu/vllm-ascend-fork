@@ -94,6 +94,30 @@ def compute_low_latency_max_recv_tokens(
     return max(calculated, min_recv_tokens)
 
 
+def compute_mc2_expand_num_rows(
+    num_input_tokens: int,
+    num_topk: int,
+    global_bs: int,
+    num_local_experts: int,
+) -> int:
+    """Return expand_x dim0 that matches PTA ``npu_moe_distribute_dispatch_v2`` output.
+
+    MC2 sizes the expand buffer from batch metadata (not the SHMEM pool cap):
+    - ``global_bs == 0`` (uniform decode + mc2_mask): ``num_input_tokens * num_topk``
+    - ``global_bs > 0``: ``global_bs * min(num_local_experts, num_topk)``
+
+    GroupedMatmulSwigluQuant tiling uses ``x.shape[0]`` as M, so ZB must narrow the
+    persistent SHMEM pool to this row count before GMM, same as the tight PTA tensor.
+    """
+    if num_input_tokens <= 0 or num_topk <= 0:
+        raise ValueError("num_input_tokens and num_topk must be positive")
+    if num_local_experts <= 0:
+        raise ValueError("num_local_experts must be positive")
+    if global_bs == 0:
+        return num_input_tokens * num_topk
+    return global_bs * min(num_local_experts, num_topk)
+
+
 def estimate_local_mem_size(
     max_recv_tokens: int,
     hidden_size: int,

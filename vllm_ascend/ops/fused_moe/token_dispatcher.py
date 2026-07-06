@@ -640,16 +640,33 @@ class TokenDispatcherWithZB(TokenDispatcherWithMC2):
 
         # GMM calls dispose_tensor() on the dispatch output when dynamic_scale is
         # set; that must not touch the persistent SHMEM expand_x_out buffer.
-        expand_x_for_gmm = bundle.expand_x_out.detach()
+        from vllm_ascend.ops.fused_moe.zb_runtime import compute_mc2_expand_num_rows
 
-        # Always wire gmm2 into the full combine_x buffer (same shape as expand_x_out).
-        # Valid token count is carried by group_list / expert_token_nums only.
-        # Do not call .item() here: it syncs the NPU stream and breaks ACLGraph capture.
-        gmm2_out = bundle.combine_x
+        num_local_experts = moe_expert_num // self.ep_world_size
+        num_expand_rows = compute_mc2_expand_num_rows(
+            hidden_states.shape[0],
+            topk_ids.shape[1],
+            self.global_bs,
+            num_local_experts,
+        )
+        if num_expand_rows > bundle.expand_x_out.shape[0]:
+            raise RuntimeError(
+                "ZB SHMEM expand_x pool is smaller than MC2-aligned expand row count; "
+                f"num_expand_rows={num_expand_rows} pool_rows={bundle.expand_x_out.shape[0]} "
+                f"global_bs={self.global_bs} num_input_tokens={hidden_states.shape[0]} "
+                f"num_topk={topk_ids.shape[1]} num_local_experts={num_local_experts}."
+            )
+        # Narrow to MC2-tight rows so GMM tiling sees the same x.shape[0] as PTA MC2.
+        # Uses tensor shapes only (no .item()) so ACL graph capture stays valid.
+        expand_x_for_gmm = bundle.expand_x_out.detach().narrow(0, 0, num_expand_rows)
+        dynamic_scale_for_gmm = None
+        if use_quant:
+            dynamic_scale_for_gmm = aux["dynamic_scales"].narrow(0, 0, num_expand_rows)
+        gmm2_out = bundle.combine_x.narrow(0, 0, num_expand_rows)
 
         return MoETokenDispatchOutput(
             hidden_states=expand_x_for_gmm,
-            dynamic_scale=aux["dynamic_scales"] if use_quant else None,
+            dynamic_scale=dynamic_scale_for_gmm,
             group_list=aux["expert_token_nums"],
             group_list_type=expert_token_nums_type,
             gmm2_out=gmm2_out,
