@@ -260,7 +260,7 @@ def w8a8_gmm1_swiglu(
     dynamic_scales: torch.Tensor,
     expert_token_nums: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    group_list = expert_token_nums.to(torch.int32)
+    group_list = expert_token_nums.to(torch.int64)
     y1_int32 = torch_npu.npu_grouped_matmul(
         x=[expand_x],
         weight=[gmm1_weight],
@@ -293,7 +293,7 @@ def w8a8_gmm2(
     output_dtype: torch.dtype = torch.bfloat16,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    group_list = expert_token_nums.to(torch.int32)
+    group_list = expert_token_nums.to(torch.int64)
     gmm2_scale = gmm2_weight_scale.to(torch.float32)
     if out is None:
         return torch_npu.npu_grouped_matmul(
