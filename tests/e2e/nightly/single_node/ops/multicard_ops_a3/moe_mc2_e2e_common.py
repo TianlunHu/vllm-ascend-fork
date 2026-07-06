@@ -76,6 +76,20 @@ def mc2_trace_dir(default: str) -> str:
     )
 
 
+def mc2_max_tokens_per_rank() -> int | None:
+    """Optional cudagraph capture cap per TP rank (mirrors serving ``_num_tokens_per_tp_rank``).
+
+    Example: ``max_num_seqs=128``, ``tp=4`` → ``(128 + 3) // 4 = 32``.
+    When unset, ZB SHMEM pools are sized from ``num_tokens`` only.
+    """
+    raw = os.environ.get("VLLM_ASCEND_MOE_MC2_TEST_MAX_TOKENS_PER_RANK")
+    if raw is None or raw == "":
+        raw = os.environ.get("VLLM_ASCEND_ZB_TEST_MAX_TOKENS_PER_RANK")
+    if raw is None or raw == "":
+        return None
+    return int(raw)
+
+
 def mc2_shape_config(world_size: int) -> dict:
     """Read tensor shapes; falls back to VLLM_ASCEND_ZB_TEST_* for cross-test parity."""
     num_tokens = mc2_int_env(

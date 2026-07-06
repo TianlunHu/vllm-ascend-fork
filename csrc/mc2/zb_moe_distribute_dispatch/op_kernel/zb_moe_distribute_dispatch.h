@@ -96,7 +96,7 @@ private:
     __aicore__ inline void SplitToCore(uint32_t curSendCnt, uint32_t curUseAivNum, uint32_t &startTokenId,
                                        uint32_t &endTokenId, uint32_t &sendTokenNum, bool isFront = true);
     __aicore__ inline void CalTokenSendExpertCnt(uint32_t dstExpertId, int32_t calCnt, int32_t &curExpertCnt);
-    __aicore__ inline void ReorderRecvDataOutput(int32_t rankId, bool isCumSum = false);
+    __aicore__ inline void ReorderRecvDataOutput(int32_t rankId, LocalTensor<int32_t> &transLt, bool isCumSum = false);
 
     TPipe *tpipe_{nullptr};
     GlobalTensor<XType> xGMTensor_;
@@ -138,6 +138,7 @@ private:
     TBuf<> gatherMaskTBuf_;
     TBuf<> sendCountLocalBuf_;
     TBuf<> recvDataBuf_;
+    TBuf<> sendCountBuf_;
     TBuf<> syncStatusBuf_;
     TBuf<> syncWaitStatusBuf_;
     TBuf<> syncGatherMaskBuf_;
@@ -580,38 +581,40 @@ __aicore__ inline void ZbMoeDistributeDispatch<TemplateMC2TypeFunc>::WaitNotify(
     DataCopyPad(recvDataTensor_, allExpertTokenNumsGMTensor_, recvDataParams, copyPadInt32Params);
     PipeBarrier<PIPE_ALL>();
 
+    tpipe_->InitBuffer(sendCountBuf_, Ceil(moeExpertNum_ * sizeof(int32_t), UB_ALIGN_SIZE) * UB_ALIGN_SIZE);
+    LocalTensor<int32_t> recvTokenLt = sendCountBuf_.Get<int32_t>();
+
     // Convert the global rank-by-expert count matrix into per-rank prefix sums for output offsets.
-    // Write prefix sums directly into sendCountsGlobal to avoid per-rank UB staging + GM copy.
     for (uint32_t rank = startRankId; rank < endRankId; ++rank) {
-        ReorderRecvDataOutput(rank, true);
+        ReorderRecvDataOutput(rank, recvTokenLt, true);
+        SyncFunc<AscendC::HardEvent::MTE2_MTE3>();
+        DataCopyExtParams copyParams{1, static_cast<uint32_t>(moeExpertNum_ * sizeof(int32_t)), 0, 0, 0};
+        DataCopyPad(sendCountsGlobal[rank * moeExpertNum_], recvTokenLt, copyParams);
 
         if (rank == static_cast<uint32_t>(epRankId_)) {
             SyncFunc<AscendC::HardEvent::MTE3_S>();
-            const uint32_t gmBase = static_cast<uint32_t>(epRankId_) * moeExpertNum_;
             int64_t tokenSums = 0;
             for (uint32_t localMoeIndex = 0; localMoeIndex < moeExpertNumPerRank_; ++localMoeIndex) {
                 uint32_t curIndex = epWorldSize_ * (localMoeIndex + 1) - 1;
-                int32_t prevCount =
-                    (localMoeIndex == 0) ? 0 : sendCountsGlobal.GetValue(gmBase + curIndex - epWorldSize_);
-                int32_t currCount = sendCountsGlobal.GetValue(gmBase + curIndex);
+                int32_t prevCount = (localMoeIndex == 0) ? 0 : recvTokenLt.GetValue(curIndex - epWorldSize_);
+                int32_t currCount = recvTokenLt.GetValue(curIndex);
                 tokenSums = ((expertTokenNumsType_ == 0U) ? tokenSums : 0) + (currCount - prevCount);
                 expertTokenNumsGlobal.SetValue(localMoeIndex, tokenSums);
             }
         }
     }
-    PipeBarrier<PIPE_ALL>();
-    SyncFunc<AscendC::HardEvent::MTE3_S>();
 }
 
 template <TemplateMC2TypeClass>
-__aicore__ inline void ZbMoeDistributeDispatch<TemplateMC2TypeFunc>::ReorderRecvDataOutput(int32_t rankId,
-                                                                                          bool isCumSum)
+__aicore__ inline void ZbMoeDistributeDispatch<TemplateMC2TypeFunc>::ReorderRecvDataOutput(
+    int32_t rankId, LocalTensor<int32_t> &transLt, bool isCumSum)
 {
     uint32_t moeExpertPerRankNum = moeExpertNum_ / epWorldSize_;
-    uint32_t startExpId = static_cast<uint32_t>(rankId) * moeExpertPerRankNum;
-    uint32_t endExpId = startExpId + moeExpertPerRankNum;
-    const uint32_t gmBase = static_cast<uint32_t>(rankId) * moeExpertNum_;
+    uint32_t startExpId = rankId * moeExpertPerRankNum;
+    uint32_t endExpId = rankId * moeExpertPerRankNum + moeExpertPerRankNum;
 
+    SyncFunc<AscendC::HardEvent::V_S>();
+    SyncFunc<AscendC::HardEvent::MTE2_S>();
     // Traverse source ranks inside each expert so the cumulative value remains a count, not an offset.
     int32_t prefixSum = 0;
     for (uint32_t expId = startExpId; expId < endExpId; ++expId) {
@@ -621,9 +624,11 @@ __aicore__ inline void ZbMoeDistributeDispatch<TemplateMC2TypeFunc>::ReorderRecv
 
             int32_t curRecvCount = recvDataTensor_(pairIdx);
             prefixSum += curRecvCount;
-            sendCountsGlobal.SetValue(gmBase + index, isCumSum ? prefixSum : curRecvCount);
+            transLt(index) = isCumSum ? prefixSum : curRecvCount;
         }
     }
+    PipeBarrier<PIPE_ALL>();
+    SyncFunc<AscendC::HardEvent::S_MTE2>();
 }
 
 /*

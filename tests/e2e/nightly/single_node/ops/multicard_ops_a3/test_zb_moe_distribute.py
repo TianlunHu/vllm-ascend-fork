@@ -50,6 +50,15 @@ Requires:
 
 Shape/bench env (shared with PTA/Fused baseline tests):
   ``VLLM_ASCEND_MOE_MC2_TEST_*`` (preferred), legacy ``VLLM_ASCEND_ZB_TEST_*`` fallback.
+
+Serve-like ZB pool sizing (``max_num_seqs=128``, ``tp=4`` → per-rank cap 32)::
+
+  VLLM_ASCEND_MOE_MC2_TEST_MAX_TOKENS_PER_RANK=32 \\
+    python .../test_zb_moe_distribute.py --mode bench --world-size 4 --num-tokens 8 ...
+
+w8a8 comm quant (``quant_mode=2`` / ``comm_quant_mode=2``, matches serving ``--quantization ascend``)::
+
+  python .../test_zb_moe_distribute.py --mode bench --w8a8 --world-size 4 --num-tokens 8 ...
 """
 
 from __future__ import annotations
@@ -73,6 +82,7 @@ from moe_mc2_e2e_common import (  # type: ignore[import-not-found,import-untyped
     mc2_bench_iters,
     mc2_hccl_port,
     mc2_int_env,
+    mc2_max_tokens_per_rank,
     mc2_profile_iters,
     mc2_shape_config,
     mc2_trace_dir,
@@ -95,6 +105,7 @@ from zb_moe_prof_utils import (  # type: ignore[import-not-found,import-untyped]
 from vllm_ascend.ops.fused_moe.zb_runtime import (
     LowLatencyZbTensors,
     ZbMoERuntime,
+    compute_low_latency_max_recv_tokens,
     estimate_local_mem_size,
     zb_moe_distribute_combine,
     zb_moe_distribute_dispatch,
@@ -106,6 +117,16 @@ enable_custom_op()
 
 def _test_mode() -> str:
     return os.environ.get("VLLM_ASCEND_ZB_TEST_MODE", "correctness").strip().lower()
+
+
+def _w8a8_enabled() -> bool:
+    for key in ("VLLM_ASCEND_MOE_MC2_TEST_W8A8", "VLLM_ASCEND_ZB_TEST_W8A8"):
+        raw = os.environ.get(key, "").strip().lower()
+        if raw in ("1", "true", "yes", "on"):
+            return True
+        if raw in ("0", "false", "no", "off"):
+            return False
+    return False
 
 
 def _shmem_server_ipport() -> str:
@@ -180,6 +201,7 @@ class ZbMoeOpContext:
     num_local_experts: int
     global_bs: int
     num_max_tokens: int
+    use_w8a8: bool
     device: str
     group_ep: str
     runtime: ZbMoERuntime
@@ -195,6 +217,10 @@ class ZbMoeOpContext:
     pta_tp_send_counts: torch.Tensor | None = None
     pta_expand_scales: torch.Tensor | None = None
 
+    @property
+    def quant_mode(self) -> int:
+        return 2 if self.use_w8a8 else 0
+
     def run_zb_dispatch(self) -> None:
         zb_moe_distribute_dispatch(
             x=self.x,
@@ -209,10 +235,16 @@ class ZbMoeOpContext:
             ep_rank_id=self.rank,
             moe_expert_num=self.num_experts,
             ext_info=self.runtime.ext_info,
+            quant_mode=self.quant_mode,
             global_bs=self.global_bs,
         )
 
     def run_zb_combine(self) -> None:
+        # Non-quant: dispatch writes expand_x_out; combine reads combine_x, so ori_x
+        # copies received tokens for identity round-trip without GMM.
+        # Quant: expand_x_out aliases combine_x as INT8; serving uses ori_x=None.
+        ori_x = None if self.use_w8a8 else self.bundle.expand_x_out
+        expand_scales = self.aux["dynamic_scales"] if self.use_w8a8 else None
         zb_moe_distribute_combine(
             expand_x=self.bundle.combine_x,
             expert_ids=self.topk_idx,
@@ -221,12 +253,14 @@ class ZbMoeOpContext:
             expert_scales=self.topk_weights,
             combined_x=self.combined_x,
             tp_send_count=self.aux["tp_recv_count"],
-            ori_x=self.bundle.expand_x_out,
+            ori_x=ori_x,
+            expand_scales=expand_scales,
             ep_world_size=self.world_size,
             ep_rank_id=self.rank,
             moe_expert_num=self.num_experts,
             ext_info=self.runtime.ext_info,
             global_bs=self.global_bs,
+            comm_quant_mode=self.quant_mode,
         )
 
     def run_zb_dispatch_combine(self) -> None:
@@ -249,7 +283,7 @@ class ZbMoeOpContext:
             tp_rank_id=0,
             expert_shard_type=0,
             shared_expert_rank_num=0,
-            quant_mode=0,
+            quant_mode=self.quant_mode,
             global_bs=self.global_bs,
             expert_token_nums_type=1,
         )
@@ -287,7 +321,7 @@ class ZbMoeOpContext:
             expert_shard_type=0,
             shared_expert_rank_num=0,
             global_bs=self.global_bs,
-            comm_quant_mode=0,
+            comm_quant_mode=self.quant_mode,
         )
 
     def run_pta_dispatch_combine(self) -> None:
@@ -297,18 +331,27 @@ class ZbMoeOpContext:
 
 def _build_context(rank: int, world_size: int) -> ZbMoeOpContext:
     cfg = mc2_shape_config(world_size)
+    use_w8a8 = _w8a8_enabled()
     num_tokens = cfg["num_tokens"]
     hidden = cfg["hidden"]
     num_topk = cfg["num_topk"]
     num_experts = cfg["num_experts"]
     num_local_experts = cfg["num_local_experts"]
     global_bs = cfg["global_bs"]
-    num_max_tokens = global_bs * num_local_experts
+    # Match TokenDispatcherWithZB / serving: global_bs * min(local_experts, topk), floored at 1024.
+    num_max_tokens = compute_low_latency_max_recv_tokens(
+        num_tokens_per_rank=num_tokens,
+        ep_world_size=world_size,
+        num_local_experts=num_local_experts,
+        experts_per_token=num_topk,
+        max_tokens_per_rank=mc2_max_tokens_per_rank(),
+    )
     device = f"npu:{rank}"
 
     local_mem_size = estimate_local_mem_size(
         num_max_tokens,
         hidden,
+        use_quant=use_w8a8,
         moe_expert_num=num_experts,
         ep_world_size=world_size,
     )
@@ -324,7 +367,7 @@ def _build_context(rank: int, world_size: int) -> ZbMoeOpContext:
         max_recv_tokens=num_max_tokens,
         hidden_size=hidden,
         device=device,
-        use_quant=False,
+        use_quant=use_w8a8,
     )
     aux = _allocate_aux_tensors(
         num_tokens, num_topk, num_experts, world_size, num_local_experts, num_max_tokens, device
@@ -342,6 +385,7 @@ def _build_context(rank: int, world_size: int) -> ZbMoeOpContext:
         num_local_experts=num_local_experts,
         global_bs=global_bs,
         num_max_tokens=num_max_tokens,
+        use_w8a8=use_w8a8,
         device=device,
         group_ep=_get_group_ep(rank),
         runtime=runtime,
@@ -421,7 +465,18 @@ def _run_correctness(ctx: ZbMoeOpContext) -> None:
     torch.npu.synchronize()
     dist.barrier()
 
-    _verify_combine_local(ctx.combined_x, ctx.x, ctx.topk_weights, ctx.topk_idx, ctx.rank)
+    if ctx.use_w8a8:
+        _verify_combine_local(
+            ctx.combined_x,
+            ctx.x,
+            ctx.topk_weights,
+            ctx.topk_idx,
+            ctx.rank,
+            atol=5e-2,
+            rtol=5e-2,
+        )
+    else:
+        _verify_combine_local(ctx.combined_x, ctx.x, ctx.topk_weights, ctx.topk_idx, ctx.rank)
 
 
 def _run_bench(ctx: ZbMoeOpContext) -> None:
@@ -512,6 +567,8 @@ def _run_bench(ctx: ZbMoeOpContext) -> None:
         num_tests=num_tests,
     )
     if ctx.rank == 0:
+        quant_label = "w8a8 (quant_mode=2)" if ctx.use_w8a8 else "bf16 (quant_mode=0)"
+        print(f"\n  Quantization: {quant_label}\n", flush=True)
         zb_kineto_total = (zb_kernels[0] + zb_kernels[1]) * 1e3
         pta_kineto_total = (pta_kernels[0] + pta_kernels[1]) * 1e3
         zb_rt_ms = zb_roundtrip[0] * 1e3
@@ -704,6 +761,11 @@ def _parse_args() -> argparse.Namespace:
         type=str,
         default=mc2_trace_dir("./traces/zb_moe"),
     )
+    parser.add_argument(
+        "--w8a8",
+        action="store_true",
+        help="enable w8a8 comm quant (quant_mode=2) for both ZB and PTA MC2 paths",
+    )
     return parser.parse_args()
 
 
@@ -720,6 +782,9 @@ if __name__ == "__main__":
     os.environ["VLLM_ASCEND_MOE_MC2_TEST_NUM_TESTS"] = str(args.num_tests)
     os.environ["VLLM_ASCEND_MOE_MC2_TEST_NUM_PROFILE_TESTS"] = str(args.num_profile_tests)
     os.environ["VLLM_ASCEND_MOE_MC2_TEST_TRACE_DIR"] = args.trace_dir
+    if args.w8a8:
+        os.environ["VLLM_ASCEND_MOE_MC2_TEST_W8A8"] = "1"
+        os.environ["VLLM_ASCEND_ZB_TEST_W8A8"] = "1"
     # Mirror resolved values for legacy ZB_TEST_* readers.
     os.environ["VLLM_ASCEND_ZB_TEST_WORLD_SIZE"] = str(args.world_size)
     os.environ["VLLM_ASCEND_ZB_TEST_NUM_TOKENS"] = str(args.num_tokens)
